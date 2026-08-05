@@ -1,0 +1,16 @@
+[project]
+name = "autoconnect"
+version = "0.1.0"
+description = "Linux solver/bot for the 宠物连连看 (Pokémon Lianliankan) Flash game"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pillow",
+    "scikit-image",
+    "scikit-learn",
+    "scipy",
+    "opencv-python-headless",
+]
+
+[tool.uv]
+package = false

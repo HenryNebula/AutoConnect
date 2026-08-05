@@ -144,3 +144,8 @@ checkpoints/
 log/
 .idea/
 static/flashplayer.exe
+# AutoConnect solver: heavy / regenerable artifacts
+solver/tools/
+solver/decompiled/
+solver/build/
+center.png
