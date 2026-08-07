@@ -11,6 +11,11 @@ import time
 import urllib.request
 
 CDP_PORT = 9222
+# Chrome/Ruffle can go unresponsive for well over 5 s during level transitions,
+# and the websocket can drop across page reloads. So recv uses a generous
+# timeout and _send retries with a reconnect rather than crashing on one stall.
+RECV_TIMEOUT = 30.0
+MAX_RETRIES = 3
 
 
 def _page_ws_url() -> str:
@@ -34,22 +39,47 @@ def connect():
     global _ws
     import websocket
     if _ws is None:
-        _ws = websocket.create_connection(_page_ws_url(), timeout=5)
+        _ws = websocket.create_connection(_page_ws_url(), timeout=RECV_TIMEOUT)
     return _ws
+
+
+def _reset_connection():
+    """Drop the current websocket so the next connect() re-fetches the page
+    target (its URL can change across navigations/reloads)."""
+    global _ws
+    if _ws is not None:
+        try:
+            _ws.close()
+        except Exception:  # noqa: BLE001
+            pass
+    _ws = None
 
 
 def _send(method: str, params: dict | None = None):
     global _mid
-    connect()
-    _mid += 1
-    my_id = _mid
-    _ws.send(json.dumps({"id": my_id, "method": method, "params": params or {}}))
-    while True:
-        resp = json.loads(_ws.recv())
-        if resp.get("id") == my_id:
-            if "error" in resp:
-                raise RuntimeError(f"CDP error on {method}: {resp['error']}")
-            return resp.get("result", {})
+    import websocket
+    last_err = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            connect()
+            _mid += 1
+            my_id = _mid
+            _ws.send(json.dumps({"id": my_id, "method": method, "params": params or {}}))
+            while True:
+                resp = json.loads(_ws.recv())
+                if resp.get("id") == my_id:
+                    if "error" in resp:
+                        # Legitimate method error (e.g. a JS exception) -- don't retry.
+                        raise RuntimeError(f"CDP error on {method}: {resp['error']}")
+                    return resp.get("result", {})
+        except (websocket.WebSocketTimeoutException, websocket.WebSocketException, OSError) as e:
+            # Transient: the renderer stalled mid-transition, or the socket
+            # dropped on a page reload. Reconnect and retry.
+            last_err = e
+            _reset_connection()
+            time.sleep(0.5 * (attempt + 1))
+            continue
+    raise RuntimeError(f"CDP {method} failed after {MAX_RETRIES} retries: {last_err}")
 
 
 def move(x: float, y: float):
