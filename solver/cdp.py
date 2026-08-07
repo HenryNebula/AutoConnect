@@ -7,10 +7,13 @@ i.e. identical to window-relative pixel coordinates.
 """
 from __future__ import annotations
 import json
+import os
 import time
 import urllib.request
 
-CDP_PORT = 9222
+# Configurable so multiple game sessions can run isolated (e.g. a second agent's
+# harvest on 9222 while tests use 9223). Set CDP_PORT in the environment.
+CDP_PORT = int(os.environ.get("CDP_PORT", "9222"))
 # Chrome/Ruffle can go unresponsive for well over 5 s during level transitions,
 # and the websocket can drop across page reloads. So recv uses a generous
 # timeout and _send retries with a reconnect rather than crashing on one stall.
