@@ -23,7 +23,7 @@ import time
 sys.path.insert(0, os.path.dirname(__file__))
 import cdp  # noqa: E402
 
-CDP_PORT = 9222
+CDP_PORT = int(os.environ.get("CDP_PORT", "9222"))
 DEFAULT_WINS = 3
 
 

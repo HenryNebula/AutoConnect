@@ -1,4 +1,16 @@
 #!/usr/bin/env bash
+# !!! BROKEN — KEPT FOR REFERENCE ONLY. DO NOT USE. !!!
+# This FROM-SCRATCH rebuild does not work: `-renameInvalidIdentifiers randomWord`
+# is non-deterministic, so a fresh rename never matches the identifiers in the
+# committed solver/patch/Mafokem.as, and the final `-importScript` silently
+# produces a broken SWF. See solver/patch/README.md ("Build gotcha").
+#
+# To change the SWF, edit solver/patch/Mafokem.as and run the INCREMENTAL patcher:
+#     ./solver/patch/patch_swf.sh
+# (that re-imports Mafokem.as into the existing built SWF, which carries the
+# matching rename — the only working path).
+#
+# --- Original intent below (regenerate the patched SWF from static/game.swf): ---
 # Regenerate the patched, self-solving SWF (solver/patch/game_inner.swf) from
 # the pristine game shipped in static/game.swf.
 #
