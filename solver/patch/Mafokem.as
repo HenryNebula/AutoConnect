@@ -1985,6 +1985,16 @@ package kawai2_fla
 
       public function acInstallSolver() : void
       {
+         // Idempotent: frame1() (addFrameScript 0) re-runs this on every
+         // frame-0 re-entry (e.g. the game's result-screen auto-continue).
+         // Without this guard, each re-entry re-enables the solver (acEnabled
+         // = true, overwriting acSetEnabled(false)) AND spawns a fresh Timer
+         // without stopping the old one -> leaked running Timers + solver
+         // fighting an external driver (the CV bot). Install once only.
+         if(acTimer != null)
+         {
+            return;
+         }
          acClears = 0;
          acFails = 0;
          acEnabled = true;
