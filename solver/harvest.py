@@ -44,8 +44,9 @@ PAIR_NCC_MIN = 0.50   # discard pinned pairs below this NCC (misdetections)
 # per-move timing
 REMOVE_SETTLE = 0.10   # s between acPlayOne and the after-snap: long enough for
                        # the removal to render, short enough to beat tile drift
-DRIFT_SETTLE = 0.22    # s after the after-snap: let any per-move tile drift
-                       # (L2 "下移" … L13 "中心靠拢") finish before the next frame
+DRIFT_SETTLE = 0.12    # s after the after-snap: let the removal animation settle
+                       # before the next before-snap (no real lattice drift was
+                       # ever observed on the movement levels, so this is small)
 WIN_FRAC = 0.45        # central-window half-size as a fraction of tile stride
 EXPECT = (12, 8)       # visible grid (cols, rows); 14×10 includes routing border
 
@@ -393,14 +394,18 @@ def wait_next_board(oc, from_level, prev_clears, timeout=95.0):
     return st.get("level")
 
 
-def run(boards_per_level=6, max_runs=12, max_level=13):
+def run(boards_per_level=6, max_runs=12, max_level=13, resume=True):
     """Harvest ``boards_per_level`` full boards per level across all 13 image sets.
 
     Strategy: harvest the current full board to empty (clearing it), then let the
     autonomous solver advance to the next level and freeze on its full board.
     The solver does the ascending (reliably); we only catch full boards, so
     detect_grid always sees a dense 12x8 lattice. Repeat runs until every level
-    has enough boards."""
+    has enough boards.
+
+    With ``resume`` (default), existing shards are counted toward the per-level
+    target and seq continues after them, so re-running scales the dataset up
+    without clobbering good boards."""
     oc = Oracle()
     oc.freeze()
     assert oc.wait_ready(), "oracle not ready (is the patched SWF loaded on :8765?)"
@@ -408,6 +413,16 @@ def run(boards_per_level=6, max_runs=12, max_level=13):
 
     counts = {L: 0 for L in range(1, max_level + 1)}
     seq = 0
+    if resume:
+        for path, sh in dsio.iter_harvest_shards():
+            L = int(sh["level"])
+            if 1 <= L <= max_level:
+                counts[L] += 1
+            seq += 1
+        have = sum(counts.values())
+        if have:
+            print(f"[harvest] resume: {have} existing boards "
+                  f"(per-L={list(counts.values())}); target={boards_per_level}/L")
     run_i = 0
     t_start = time.time()
     while min(counts.values()) < boards_per_level and run_i < max_runs:

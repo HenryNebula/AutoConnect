@@ -25,7 +25,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 import dsio
-from pairnet import PairNet, CANON
+from pairnet import PairNet, CANON, PRESETS
 from gallery import color_ncc
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -136,10 +136,12 @@ def _report(name, scores, labels):
                 n_same=int(len(same)), n_diff=int(len(diff)))
 
 
-def train(epochs=25, batch=256, lr=1e-3, seed=0, tag=None):
+def train(epochs=25, batch=256, lr=1e-3, seed=0, tag=None, preset="default"):
     torch.manual_seed(seed)
     np.random.seed(seed)
     dsio.ensure_dirs(dsio.MODELS_DIR)
+    cfg = PRESETS[preset]
+    print(f"[train] preset={preset} widths={cfg['widths']} embed={cfg['embed_dim']}")
 
     tr = _load_split("train")
     va = _load_split("val")
@@ -151,7 +153,7 @@ def train(epochs=25, batch=256, lr=1e-3, seed=0, tag=None):
 
     tr_ds = PairDataset(*tr[:3], augment=True, seed=seed)
     loader = DataLoader(tr_ds, batch_size=batch, shuffle=True, drop_last=True)
-    model = PairNet().to(DEVICE)
+    model = PairNet(**cfg).to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
     bce = nn.BCEWithLogitsLoss()
@@ -182,10 +184,10 @@ def train(epochs=25, batch=256, lr=1e-3, seed=0, tag=None):
 
     if best_state is not None:
         model.load_state_dict(best_state)
-    tag = tag or f"auc{best_val_auc:.3f}"
+    tag = tag or f"{preset}_auc{best_val_auc:.3f}"
     out_path = os.path.join(dsio.MODELS_DIR, f"pairnet_{tag}.pt")
-    torch.save({"state_dict": model.state_dict(), "embed_dim": PairNet().backbone.head[-2].out_features,
-                "canon": CANON}, out_path)
+    torch.save({"state_dict": model.state_dict(), "widths": list(cfg["widths"]),
+                "embed_dim": cfg["embed_dim"], "canon": CANON}, out_path)
     print(f"[train] saved best (val_auc={best_val_auc:.4f}) -> {out_path}")
 
     # ---- head-to-head evaluation on the board-disjoint test set ----
@@ -214,5 +216,7 @@ if __name__ == "__main__":
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--preset", choices=list(PRESETS), default="default",
+                    help="default=max accuracy; tiny=~2x faster CPU inference")
     a = ap.parse_args()
-    train(a.epochs, a.batch, a.lr, a.seed)
+    train(a.epochs, a.batch, a.lr, a.seed, preset=a.preset)

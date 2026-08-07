@@ -23,7 +23,7 @@ import numpy as np
 import torch
 
 import dsio
-from pairnet import PairNet, CANON
+from pairnet import PairNet, CANON, load_pairnet
 import gallery as galmod
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -37,10 +37,8 @@ class NNClassifier:
         if model_path is None:
             model_path = _latest_model()
         if model_path and os.path.exists(model_path):
-            ckpt = torch.load(model_path, map_location=DEVICE)
-            self.model = PairNet().to(DEVICE)
-            self.model.load_state_dict(ckpt["state_dict"])
-            self.model.eval()
+            self.model, _cfg = load_pairnet(model_path, map_location=DEVICE)
+            self.model.to(DEVICE).eval()
             self.path = model_path
         else:
             self.path = None
