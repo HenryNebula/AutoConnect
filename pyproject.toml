@@ -10,6 +10,14 @@ dependencies = [
     "scikit-learn",
     "scipy",
     "opencv-python-headless",
+    "websocket-client",
+    # supervised tile-pair classifier (issue #3). Default (CUDA) wheels so
+    # training uses the GPU when available; train_classifier.py falls back to CPU.
+    "torch",
+    # CPU serving of the trained pair classifier (ONNX export + inference).
+    "onnxruntime",
+    "onnx",
+    "onnxscript",
 ]
 
 [tool.uv]
