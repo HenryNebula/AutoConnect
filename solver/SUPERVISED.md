@@ -75,6 +75,15 @@ scale / brightness augmentation (mirroring NCC's translation tolerance). Reports
 held-out AUC/accuracy and the **same-vs-different separation** of NN and NCC side
 by side, plus on the hard-negative subset specifically.
 
+### 3b. `contrastive.py` — supervised contrastive variant (`build_crops.py`)
+
+An alternative that is **more scalable**: train the same backbone with the
+supervised contrastive loss (SupCon) on type-labelled crops, so cost grows with
+the crop count (linear), not a materialised pair set (quadratic). Labels are
+exact oracle-grounded *within-board* type clusters. Same/different is embedding
+cosine; reports the same AUC + L13 type-count metrics. On a snapshot it matches
+the siamese (AUC 1.0000, acc 99.94%).
+
 ### 4. `gallery_nn.py` — evaluation + runtime hook
 
 * `NNClassifier.sim(a, b)` is the drop-in for `color_ncc` (same-type probability
