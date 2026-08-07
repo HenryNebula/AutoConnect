@@ -10,7 +10,19 @@ dependencies = [
     "scikit-learn",
     "scipy",
     "opencv-python-headless",
+    "websocket-client",
+    # supervised tile-pair classifier (issue #3): tiny CNN over 40x40 crops.
+    # CPU wheels are sufficient and far smaller than the default CUDA build.
+    "torch",
 ]
 
 [tool.uv]
 package = false
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
