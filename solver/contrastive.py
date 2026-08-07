@@ -2,20 +2,21 @@
 pair term.
 
 Plain SupCon trains an embedding with the contrastive loss on randomly-sampled
-batches of type-labelled crops. Because each batch is dominated by *easy*
-different-type pairs (cross-type NCC median ~0.12), the rare confusable pairs
-get little gradient and SupCon collapses them (measured hard-neg acc ~1.4%).
+batches of type-labelled crops; same/different is embedding cosine at runtime.
 
-To fix that, this trainer adds an explicit **hard-negative pair term**: a margin
-contrastive loss on the mined hard-negative pairs (build_dataset's NCC>=0.28
-cross-type pairs) plus matching same-type positives, sharing the same backbone.
-The SupCon term gives broad, scalable structure; the pair term forces the
-confusable-pair boundary. The two train boards coincide (build_crops and
-build_dataset share the seed/shuffle), so there is no split leakage.
+The optional **hard-negative pair term** (`--hard-neg`) adds a margin contrastive
+loss on the mined hard-negative pairs (build_dataset's NCC>=0.28 cross-type
+pairs) + matching same-type positives, sharing the same backbone. NOTE: on the
+10x test set it reduces the *bulk* hard-negative cosine (median 0.74 -> 0.55) but
+does NOT change hard-negative accuracy (~98.6% either way -- plain SupCon does
+NOT collapse on hard negatives). It is an optional margin tightener, not a
+required fix. (An earlier version of this doc claimed a "1.4% collapse"; that was
+a metric bug -- the misclassification rate was mislabeled as accuracy.)
 
-Eval reports: same/different by embedding cosine (crop test), the hard-negative
-accuracy on the pair test set (the metric SupCon-fail was exposed by), and the
-within-board L13 type-count.
+Eval reports: same/different by embedding cosine (crop test), hard-negative
+accuracy on the pair test set, and the within-board L13 type-count. The metric
+that actually distinguishes these models from NCC is jitter robustness -- see
+`solver/eval_robustness.py`.
 """
 from __future__ import annotations
 
@@ -266,7 +267,7 @@ def _inf(loader):
 
 
 def train(epochs=30, batch=512, lr=1e-3, temperature=0.07, seed=0, preset="default",
-          hard_neg=True, pair_weight=1.0, margin_gap=0.3, tag=None):
+          hard_neg=False, pair_weight=1.0, margin_gap=0.3, tag=None):
     torch.manual_seed(seed); np.random.seed(seed)
     dsio.ensure_dirs(dsio.MODELS_DIR)
     cfg = PRESETS[preset]
@@ -371,8 +372,9 @@ if __name__ == "__main__":
     ap.add_argument("--temperature", type=float, default=0.07)
     ap.add_argument("--preset", choices=list(PRESETS), default="default")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--hard-neg", action=argparse.BooleanOptionalAction, default=True,
-                    help="add the mined hard-negative pair term (default on)")
+    ap.add_argument("--hard-neg", action=argparse.BooleanOptionalAction, default=False,
+                    help="add the mined hard-negative pair term (off by default; tightens "
+                         "the hard-neg margin but does not change hard-neg accuracy)")
     ap.add_argument("--pair-weight", type=float, default=1.0)
     ap.add_argument("--margin-gap", type=float, default=0.3)
     a = ap.parse_args()
