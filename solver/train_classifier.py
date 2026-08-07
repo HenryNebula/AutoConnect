@@ -83,16 +83,16 @@ class PairDataset(Dataset):
 # train + eval
 # ---------------------------------------------------------------------------
 def _auc(scores, labels):
+    """Rank-based AUC (1.0 = perfect: all positives score above all negatives).
+    Uses ascending average ranks so ties are handled correctly."""
+    from scipy.stats import rankdata
     scores = np.asarray(scores)
     labels = np.asarray(labels)
-    order = np.argsort(-scores)
-    ranks = np.empty(len(scores), float)
-    ranks[order] = np.arange(1, len(scores) + 1)
-    n_pos = labels.sum()
+    n_pos = int(labels.sum())
     n_neg = len(labels) - n_pos
     if n_pos == 0 or n_neg == 0:
         return float("nan")
-    # rank-based AUC (handles ties via average ranks)
+    ranks = rankdata(scores)                # ascending, average ranks for ties
     s = ranks[labels == 1].sum()
     return float((s - n_pos * (n_pos + 1) / 2) / (n_pos * n_neg))
 
@@ -113,17 +113,27 @@ def _ncc_scores(ca, cb):
 
 
 def _report(name, scores, labels):
+    scores = np.asarray(scores)
+    labels = np.asarray(labels)
     same = scores[labels == 1]
     diff = scores[labels == 0]
     auc = _auc(scores, labels)
     acc = float(((scores >= 0.5).astype(int) == labels).mean())
-    sep = float(same.min() - diff.max()) if len(same) and len(diff) else float("nan")
+    if len(same) and len(diff):
+        sep = float(same.min() - diff.max())
+        same_min, same_med = float(same.min()), float(np.median(same))
+        diff_max, diff_med = float(diff.max()), float(np.median(diff))
+    else:
+        sep = float("nan")
+        same_min = same_med = float("nan")
+        diff_max = diff_med = float("nan")
     print(f"  {name:5s} AUC={auc:.4f} acc@0.5={acc:.4f} | "
-          f"same[min={same.min():.3f} med={np.median(same):.3f}] "
-          f"diff[max={diff.max():.3f} med={np.median(diff):.3f}] "
-          f"gap(min_same-max_diff)={sep:+.3f}")
-    return dict(auc=auc, acc=acc, same_min=float(same.min()), same_med=float(np.median(same)),
-                diff_max=float(diff.max()), diff_med=float(np.median(diff)), gap=sep)
+          f"same[min={same_min:.3f} med={same_med:.3f}] "
+          f"diff[max={diff_max:.3f} med={diff_med:.3f}] "
+          f"gap(min_same-max_diff)={sep:+.3f}  (n_same={len(same)} n_diff={len(diff)})")
+    return dict(auc=auc, acc=acc, same_min=same_min, same_med=same_med,
+                diff_max=diff_max, diff_med=diff_med, gap=sep,
+                n_same=int(len(same)), n_diff=int(len(diff)))
 
 
 def train(epochs=25, batch=256, lr=1e-3, seed=0, tag=None):

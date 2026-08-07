@@ -37,10 +37,19 @@ import dsio
 from gallery import color_ncc
 
 CANON = dsio.CANON
-POS_THR = 0.80      # NCC >= this => same type (above the ~0.75 cross-type ceiling)
+POS_THR = 0.80      # NCC >= this => same type. On harvested canon crops same-type
+                    # NCC has median ~0.88 (p25 ~0.81) while cross-type has median
+                    # ~0.12 (p99 ~0.34), so 0.80 cleanly admits same-type and ~no
+                    # cross-type. (NB: this clean gap is on HARVEST crops; the BOT
+                    # fails at runtime because live perception jitter collapses it
+                    # -- hence the trained, augmentation-robust NN.)
 LINK_THR = 0.80     # cross-pair cluster link threshold (= POS_THR)
-EASY_HI = 0.60      # cross-cluster NCC below this => "easy" negative
-HARD_LO = 0.62      # cross-cluster NCC >= this (and < LINK_THR) => "hard" neg
+EASY_HI = 0.28      # cross-cluster NCC below this => "easy" (visually distant) neg
+HARD_LO = 0.28      # cross-cluster NCC in [HARD_LO, LINK_THR) => "hard" neg: the
+                    # most similar DIFFERENT-type pairs (top ~2% of cross-type),
+                    # exactly the confusable cases. (A general VLM qwen3.5-4b CANNOT
+                    # reliably tell these apart -- measured ~70% false-SAME -- which
+                    # is itself the motivation for the trained NN.)
 
 
 class _UF:
