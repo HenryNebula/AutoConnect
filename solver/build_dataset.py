@@ -37,6 +37,9 @@ import dsio
 from gallery import color_ncc
 
 CANON = dsio.CANON
+PAIR_NCC_MIN = 0.50  # trust an oracle pair as a must-link only above this; below
+                     # is a harvest misdetection (two different-type cells) that
+                     # would corrupt clusters and leak same-type into negatives.
 POS_THR = 0.80      # NCC >= this => same type. On harvested canon crops same-type
                     # NCC has median ~0.88 (p25 ~0.81) while cross-type has median
                     # ~0.12 (p99 ~0.34), so 0.80 cleanly admits same-type and ~no
@@ -132,11 +135,17 @@ def build(target_pairs=10000, hard_neg_frac=0.45, val_boards=0.10,
         crops = pairs.reshape(P * 2, CANON, CANON, 3).astype(np.uint8)
         n = len(crops)
 
-        # oracle must-links
+        # oracle must-links -- but only trust an oracle pair whose own NCC shows
+        # it is genuinely same-type (>= PAIR_NCC_MIN). A harvested "pair" below
+        # that is a misdetection (two different-type cells); unioning it would
+        # fuse two types into one impure cluster, which then leaks same-type
+        # partners into the cross-cluster NEGATIVE pool (the high-NCC "hard negs
+        # that are actually the same" problem). Skipping garbage keeps clusters pure.
+        ncc = _ncc_matrix(crops)
         uf = _UF(n)
         for k in range(P):
-            uf.union(2 * k, 2 * k + 1)
-        ncc = _ncc_matrix(crops)
+            if float(ncc[2 * k, 2 * k + 1]) >= PAIR_NCC_MIN:
+                uf.union(2 * k, 2 * k + 1)
         clust = _clusters(P, ncc, uf)
 
         # ---- positives: all clean same-type pairs (NCC >= POS_THR) ----

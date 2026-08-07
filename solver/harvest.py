@@ -36,8 +36,10 @@ import cv2
 import cdp
 import vision
 import dsio
+from gallery import color_ncc   # self-consistency QC on pinned pairs
 
 CANON = dsio.CANON
+PAIR_NCC_MIN = 0.50   # discard pinned pairs below this NCC (misdetections)
 
 # per-move timing
 REMOVE_SETTLE = 0.10   # s between acPlayOne and the after-snap: long enough for
@@ -338,7 +340,13 @@ def harvest_board(oc, level, grid0, max_moves=200):
             try:
                 ca = canon(tiles_before[r1, c1])
                 cb = canon(tiles_before[r2, c2])
-                pairs.append((ca, cb, (r1, c1), (r2, c2)))
+                # self-consistency QC: the oracle only removes SAME-type pairs,
+                # so a correctly pinned pair must have high NCC on clean crops
+                # (genuine same-type median ~0.88). A low NCC means the top-2
+                # diff cells were a misdetection (animation/gravity artefact) --
+                # discard the pair (the board still advanced via acPlayOne).
+                if color_ncc(ca, cb) >= PAIR_NCC_MIN:
+                    pairs.append((ca, cb, (r1, c1), (r2, c2)))
                 moves += 1
             except Exception:
                 pass
