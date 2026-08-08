@@ -152,3 +152,6 @@ solver/tools/
 solver/decompiled/
 solver/build/
 center.png
+# solver run/benchmark output (logs, stress-test data) -- regenerable, never commit
+solver/*.out
+solver/*.tsv
