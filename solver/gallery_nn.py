@@ -80,6 +80,33 @@ class NNClassifier:
             logits = self.model.classifier(torch.cat([d, p], dim=1)).squeeze(-1)
             return torch.sigmoid(logits).cpu().numpy()
 
+    def embed_batch(self, crops):
+        """Embed an (N, CANON, CANON, 3) uint8 array -> (N, embed_dim) float32."""
+        return self._batch_embed(crops)
+
+    def sim_matrix(self, crops):
+        """All-pairs same-type probability matrix (N,N) for (N,CANON,CANON,3)
+        crops. One batched classifier forward over the N^2 pairs -- cheap enough
+        for the runtime bot to run once per move and then index per pair in its
+        move loop (a drop-in for the per-pair ``color_ncc`` calls). Falls back to
+        a colour-NCC matrix when no model is loaded."""
+        n = len(crops)
+        if not self.available:
+            M = np.zeros((n, n), dtype=np.float32)
+            for i in range(n):
+                for j in range(i + 1, n):
+                    v = galmod.color_ncc(crops[i], crops[j])
+                    M[i, j] = M[j, i] = v
+            return M
+        import torch as _t
+        e = self._batch_embed(crops)               # (N, d)
+        et = _t.from_numpy(e).to(DEVICE)
+        with _t.no_grad():
+            d = _t.abs(et[:, None] - et[None, :])  # (N, N, d)
+            p = et[:, None] * et[None, :]
+            logits = self.model.classifier(_t.cat([d, p], dim=-1)).squeeze(-1)
+            return _t.sigmoid(logits).cpu().numpy()
+
 
 def _latest_model() -> str | None:
     if not os.path.isdir(dsio.MODELS_DIR):

@@ -51,7 +51,8 @@ def canon(crop):
 
 
 class Bot:
-    def __init__(self, gallery_path=None, verbose=True, transition_mode="ei"):
+    def __init__(self, gallery_path=None, verbose=True, transition_mode="ei",
+                 model_path=None):
         self.verbose = verbose
         self.grid = None
         self.bg = DEFAULT_BG.copy()
@@ -64,6 +65,69 @@ class Bot:
         self.empty_thr = 0.55          # NCC >= this => cell is an empty slot
         self.std_thr = 60.0            # icon-std floor (learned at level start)
         self._recover_count = 0        # deadlock-reshuffle attempts this level
+        # Learned same-type tile classifier (issue #3): the trained PairNet is a
+        # drop-in scoring function for gallery.color_ncc. If no model is present
+        # (or torch is missing) the bot falls back to colour-NCC, unchanged.
+        self.nn = self._maybe_load_nn(model_path)
+        self.use_nn = self.nn is not None and getattr(self.nn, "available", False)
+        self.cand_thr = 0.5 if self.use_nn else 0.55   # NN prob vs NCC score
+        self._sim = None            # cached all-pairs tile-sim matrix (NN only)
+        self._sim_tiles = None      # id(self.cur_tiles) the cache belongs to
+
+    @staticmethod
+    def _default_siamese_model():
+        """Pick a trained siamese PairNet (NOT a SupCon variant -- those
+        over-merge types). Prefer 'micro' (lowest latency, fewest hard
+        false-negatives), then 'default'."""
+        try:
+            import dsio
+            d = dsio.MODELS_DIR
+        except Exception:  # noqa: BLE001
+            return None
+        for name in ("pairnet_micro_auc1.000.pt", "pairnet_default_auc1.000.pt"):
+            p = os.path.join(d, name)
+            if os.path.exists(p):
+                return p
+        return None
+
+    def _maybe_load_nn(self, model_path):
+        path = model_path or os.environ.get("AC_BOT_MODEL") or self._default_siamese_model()
+        if not path or not os.path.exists(path):
+            if self.verbose:
+                print("[bot] no NN tile model found; using colour-NCC fallback")
+            return None
+        try:
+            from gallery_nn import NNClassifier
+            nn = NNClassifier(path)
+        except Exception as e:  # noqa: BLE001  (torch missing, corrupt ckpt, ...)
+            if self.verbose:
+                print(f"[bot] NN model load failed ({e!r}); using colour-NCC fallback")
+            return None
+        if self.verbose and nn.available:
+            print(f"[bot] NN tile classifier loaded: {os.path.basename(path)}")
+        return nn
+
+    def _ensure_sim(self):
+        """Pre-compute the all-pairs tile-similarity matrix for the current board
+        once per move (one batched NN forward). Subsequent per-pair lookups in
+        _pick_move / lookahead are then cheap array indexing. The NCC fallback
+        skips this and keeps scoring per-pair, as before (an O(n^2) NCC matrix
+        would be slower than scoring only the connectable pairs)."""
+        tiles = self.cur_tiles
+        if (not self.use_nn) or tiles is None or tiles is self._sim_tiles:
+            return
+        self._sim_tiles = tiles
+        R, C = tiles.shape[:2]
+        crops = np.stack([canon(tiles[r, c]) for r in range(R) for c in range(C)])
+        self._sim = self.nn.sim_matrix(crops).reshape(R, C, R, C)
+
+    def _pair_sim(self, a, b):
+        """Same-type score in [0,1] for cells a=(r,c), b=(r,c). NN probability
+        when a model is loaded, else colour-NCC (issue #3's old classifier)."""
+        if self._sim is not None:
+            return float(self._sim[a[0], a[1], b[0], b[1]])
+        return galmod.color_ncc(canon(self.cur_tiles[a[0], a[1]]),
+                                canon(self.cur_tiles[b[0], b[1]]))
 
     # ---- low level --------------------------------------------------------
     def snap(self):
@@ -259,13 +323,46 @@ class Bot:
         if cnt >= 1:
             self.bg = 0.5 * self.bg + 0.5 * (acc / cnt)
 
+    def _tiles_left(self):
+        """Current tile count from the game's ``acStatus`` -- the acceptance
+        signal (a real removal drops it by 2). Used to verify clicks instead of
+        per-cell pixel-diff, which is unreliable on the dim (~50) veiled board:
+        the selection-light toggle and low-contrast removals both produce
+        diff-40-ish false positives/negatives that desync the present mask."""
+        s = _player_call("acStatus")
+        if isinstance(s, str):
+            try:
+                return int(json.loads(s).get("tilesLeft", 99))
+            except Exception:  # noqa: BLE001
+                return 99
+        return 99
+
+    def _click_pair_removes(self, r1, c1, r2, c2, retries=3):
+        """Click a pair and confirm removal by the game's tile count dropping.
+        Retries the full two-click sequence -- the first few post-load CDP
+        clicks often don't register (cold path), so a no-removal is not proof
+        the pair is wrong. Returns True if the game removed the pair."""
+        for _ in range(retries):
+            tl0 = self._tiles_left()
+            if tl0 < 2:
+                return True
+            self.click_cell(r1, c1)
+            time.sleep(self.click_settle)
+            self.click_cell(r2, c2)
+            time.sleep(self.verify_wait)
+            if self._tiles_left() < tl0:
+                return True
+        return False
+
     def clear_board(self, max_moves=140):
         """Clear the current board, drift-safe and fast.
 
-        No per-move gallery classify: a move is chosen by translation-tolerant
-        colour-NCC over connectable pairs (the image classifier itself), and the
-        game confirms each removal by diff. Present is tracked optimistically
-        and re-derived via the icon-std floor when tile drift is detected.
+        A move is chosen by the tile classifier (trained PairNet, else colour-
+        NCC) over connectable pairs; each removal is confirmed by the GAME's
+        tile count dropping (``acStatus`` tilesLeft), with click retries for the
+        cold post-load click path. Present is tracked from confirmed removals
+        (stable); ``present_via_std`` is only re-derived on a perceived deadlock,
+        since mid-clear animations make per-frame std unreliable.
         """
         if not self.establish_grid():
             return False, 0
@@ -273,67 +370,94 @@ class Bot:
         self.learn_std_threshold(img)
         self._recover_count = 0
         present = np.ones((self.grid["rows"], self.grid["cols"]), dtype=bool)
-        self.cur_tiles = vision.extract_tiles(img, self.grid)
+
+        # Warm the click path: click top picks (with retry) until tilesLeft
+        # first drops, tracking the removal so the present mask stays exact.
+        for _ in range(15):
+            if not present.any() or self._tiles_left() < 2:
+                break
+            self.cur_tiles = vision.extract_tiles(self.snap(), self.grid)
+            mv = self._pick_move(present)
+            if mv is None:
+                break
+            (r1, c1), (r2, c2) = mv
+            if self._click_pair_removes(r1, c1, r2, c2):
+                present[r1, c1] = False
+                present[r2, c2] = False
+                break
+
         moves = 0
         fails = 0
         cleared = False
         while moves < max_moves:
-            if not present.any():
+            if not present.any() or self._tiles_left() < 2:
                 cleared = True
                 break
-            self.cur_tiles = vision.extract_tiles(img, self.grid)
+            self.cur_tiles = vision.extract_tiles(self.snap(), self.grid)
             mv = self._pick_move(present)
             if mv is None:
                 fails += 1
                 if fails > 70:
-                    # Persistent deadlock: the bot tried every connectable pair
-                    # (NCC + brute-force) and the game rejected all, so no legal
-                    # move exists. No game solver is used to escape; the level
-                    # fails. (The lookahead above prevents most deadlocks.)
+                    # No connectable pair among tracked-present cells. On a
+                    # static level that is a real deadlock; on a drift level
+                    # the tracked mask may be stale, so re-derive once from
+                    # pixels before giving up.
+                    img = self.snap()
+                    present = self.present_via_std(img)
+                    if not present.any() or self._tiles_left() < 2:
+                        cleared = True
+                        break
                     if self.verbose:
                         print(f"[bot] stuck (deadlock); {int(present.sum())} left")
                     break
-                img = self.snap()
-                present = self.present_via_std(img)
                 continue
             (r1, c1), (r2, c2) = mv
-            before = img
-            self.click_cell(r1, c1)
-            time.sleep(self.click_settle)
-            self.click_cell(r2, c2)
-            time.sleep(self.verify_wait)
-            after = self.snap()
-            d1 = self._cell_change(before, after, r1, c1)
-            d2 = self._cell_change(before, after, r2, c2)
-            if d1 > 40 and d2 > 40:
+            if self._click_pair_removes(r1, c1, r2, c2):
                 moves += 1
                 fails = 0
                 present[r1, c1] = False
                 present[r2, c2] = False
                 if moves % 12 == 0 and self.verbose:
-                    print(f"[bot] {moves} moves, {int(present.sum())} left")
+                    print(f"[bot] {moves} moves, {int(present.sum())} left", flush=True)
             else:
                 self.known_diff.add(frozenset(((r1, c1), (r2, c2))))
                 fails += 1
-                present = self.present_via_std(after)
-                if fails > 70:
+                if fails % 20 == 0:
+                    # Stall recovery: the CDP click path is intermittently flaky,
+                    # so good pairs can get wrongly blacklisted in known_diff and
+                    # a tile selection can stick. Reset both, then re-warm clicks.
+                    self.known_diff.clear()
+                    empties = [(r, c) for r in range(present.shape[0])
+                               for c in range(present.shape[1]) if not present[r, c]]
+                    if empties:
+                        er, ec = empties[0]
+                        self.click_cell(er, ec)
+                        time.sleep(0.2)
                     if self.verbose:
-                        print(f"[bot] too many fails; aborting at {int(present.sum())}")
+                        print(f"[bot] stall recovery at {moves} moves (fails={fails}): "
+                              f"cleared known_diff, reset selection", flush=True)
+                elif self.verbose and fails % 10 == 0:
+                    print(f"[bot] ...stalled: {moves} moves done, {fails} fails, "
+                          f"tilesLeft={self._tiles_left()} present={int(present.sum())}",
+                          flush=True)
+                if fails > 80:
+                    if self.verbose:
+                        print(f"[bot] too many fails; aborting at {int(present.sum())}",
+                              flush=True)
                     break
-            img = after
         if not cleared:
-            present = self.present_via_std(img)
-            cleared = not present.any()
+            cleared = self._tiles_left() < 2
         if self.verbose:
-            print(f"[bot] level done: cleared={cleared} moves={moves} left={int(present.sum())}")
+            print(f"[bot] level done: cleared={cleared} moves={moves} "
+                  f"tilesLeft={self._tiles_left()}")
         return cleared, moves
 
     def _solvable(self, present, depth=0, memo=None):
         """Recursive solvability check: can `present` be fully cleared using
-        NCC-same-type connectable pairs? My own deadlock-prevention algorithm.
-        Memoised on the present-mask for speed. Used only for small boards."""
-        import gallery as _g
-        tiles = self.cur_tiles
+        same-type connectable pairs (NN or NCC)? My own deadlock-prevention
+        algorithm. Memoised on the present-mask for speed. Used only for small
+        boards."""
+        self._ensure_sim()
         n = int(present.sum())
         if n == 0:
             return True
@@ -347,14 +471,14 @@ class Bot:
         if depth > 40:
             memo[key] = True   # bail: assume solvable (avoid blowup)
             return True
-        # enumerate high-NCC connectable pairs (same-type candidates)
+        # enumerate high-score connectable pairs (same-type candidates)
         cands = []
         for (a, b) in conn.all_connectable_pairs_anylabel(present):
             try:
-                v = _g.color_ncc(canon(tiles[a[0], a[1]]), canon(tiles[b[0], b[1]]))
-            except Exception:
+                v = self._pair_sim(a, b)
+            except Exception:  # noqa: BLE001
                 continue
-            if v >= 0.55:
+            if v >= self.cand_thr:
                 cands.append((v, a, b))
         cands.sort(reverse=True)
         for v, a, b in cands[:12]:
@@ -370,6 +494,7 @@ class Bot:
     def _ncc_safe(self, present, pair):
         """Is removing `pair` safe (leaves a solvable board)? Uses the recursive
         check for small boards, 1-ply for larger."""
+        self._ensure_sim()
         (r1, c1), (r2, c2) = pair
         p2 = present.copy()
         p2[r1, c1] = False
@@ -379,26 +504,23 @@ class Bot:
         if int(p2.sum()) <= 10:
             return self._solvable(p2)
         # 1-ply fallback for larger boards (cheap)
-        import gallery as _g
-        tiles = self.cur_tiles
         k = 0
         for (a, b) in conn.all_connectable_pairs_anylabel(p2):
             k += 1
             if k > 40:
                 return True
             try:
-                if _g.color_ncc(canon(tiles[a[0], a[1]]), canon(tiles[b[0], b[1]])) > 0.6:
+                if self._pair_sim(a, b) > self.cand_thr:
                     return True
-            except Exception:
+            except Exception:  # noqa: BLE001
                 continue
         return False
 
     def _pick_move(self, present):
-        """Pick the highest-NCC connectable same-icon pair (the image
-        classifier), with a cheap one-ply NCC lookahead to avoid stranding the
-        board into a deadlock. Skips game-rejected pairs."""
-        import gallery as _g
-        tiles = self.cur_tiles
+        """Pick the highest-scoring connectable same-icon pair (the tile
+        classifier), skipping game-rejected pairs. The classifier is the trained
+        PairNet when available (issue #3), else colour-NCC."""
+        self._ensure_sim()
         cands = []
         any_mv = None
         for (a, b) in conn.all_connectable_pairs_anylabel(present):
@@ -406,13 +528,22 @@ class Bot:
                 continue
             any_mv = (a, b) if any_mv is None else any_mv
             try:
-                v = _g.color_ncc(canon(tiles[a[0], a[1]]), canon(tiles[b[0], b[1]]))
-            except Exception:
+                v = self._pair_sim(a, b)
+            except Exception:  # noqa: BLE001
                 continue
-            if v >= 0.55:
+            if v >= self.cand_thr:
                 cands.append((v, (a, b)))
         cands.sort(reverse=True)
         if cands:
+            # Prefer a move that doesn't create a deadlock: among the top
+            # candidates, return the first whose removal leaves a board that
+            # still has a connectable same-type pair (1-ply, cheap on large
+            # boards via _ncc_safe; exact _solvable on small ones). Pure-greedy
+            # move order otherwise deadlocks ~1-in-10 layouts. Fall back to the
+            # top-scoring pair if none of the top candidates is provably safe.
+            for _v, pair in cands[:6]:
+                if self._ncc_safe(present, pair):
+                    return pair
             return cands[0][1]
         if any_mv is not None:
             return any_mv
@@ -427,8 +558,8 @@ class Bot:
                     if frozenset((a, b)) in self.known_diff:
                         continue
                     try:
-                        v = _g.color_ncc(canon(tiles[a[0], a[1]]), canon(tiles[b[0], b[1]]))
-                    except Exception:
+                        v = self._pair_sim(a, b)
+                    except Exception:  # noqa: BLE001
                         continue
                     if v > best2_ncc:
                         best2_ncc, best2 = v, (a, b)
@@ -481,10 +612,14 @@ class Bot:
             run_ok = True
             while level <= max_level:
                 t0 = time.time()
+                if self.verbose:
+                    print(f"[run] level {level}: starting (tilesLeft={self._tiles_left()})...",
+                          flush=True)
                 cleared, moves = self.clear_board()
                 dt = time.time() - t0
                 if self.verbose:
-                    print(f"[run] level {level}: cleared={cleared} moves={moves} ({dt:.0f}s)")
+                    print(f"[run] level {level}: cleared={cleared} moves={moves} ({dt:.0f}s)",
+                          flush=True)
                 if not cleared:
                     run_ok = False
                     break
@@ -536,9 +671,12 @@ def main():
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--max-level", type=int, default=13)
     ap.add_argument("--transition", default="ei", choices=["ei", "click"])
+    ap.add_argument("--model", default=None,
+                    help="path to a trained PairNet .pt (default: siamese micro)")
     ap.add_argument("-q", action="store_true")
     args = ap.parse_args()
-    bot = Bot(args.gallery, verbose=not args.q, transition_mode=args.transition)
+    bot = Bot(args.gallery, verbose=not args.q, transition_mode=args.transition,
+              model_path=args.model)
     bot.play_game(args.runs, args.max_level)
 
 
