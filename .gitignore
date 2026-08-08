@@ -139,6 +139,9 @@ cython_debug/
 
 # local folders
 local/
+# ...except the Ruffle host page: it carries the runtime overlay fix the bot
+# needs (hide the unmute icon). Force-added; the rest of local/ stays ignored.
+!local/web/index.html
 data/
 checkpoints/
 log/
@@ -149,3 +152,6 @@ solver/tools/
 solver/decompiled/
 solver/build/
 center.png
+# solver run/benchmark output (logs, stress-test data) -- regenerable, never commit
+solver/*.out
+solver/*.tsv

@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AutoConnect — Flash Game (Ruffle)</title>
+  <!-- Ruffle self-host loader: tells it where its core assets live -->
+  <script>
+    window.RufflePlayer = window.RufflePlayer || {};
+    window.RufflePlayer.config = {
+      autoplay: "on",
+      unmuteOverlay: "visible",
+      backgroundColor: "#000000",
+      publicPath: "ruffle/"
+    };
+  </script>
+  <script src="ruffle/ruffle.js"></script>
+  <style>
+    html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; }
+    /* Ruffle player fills the whole viewport; the SWF is letterboxed inside. */
+    embed, ruffle-player, ruffle-embed { display: block; width: 100vw; height: 100vh; }
+  </style>
+</head>
+<body>
+  <!-- Ruffle's polyfill auto-detects this <embed> SWF and replaces it with a player -->
+  <embed id="game" name="game" src="game_inner.swf" width="100%" height="100%" allowscriptaccess="always" />
+
+  <!-- Hide Ruffle's "click to unmute" speaker ICON only.
+       The overlay's .background is a 70%-black veil that crushes the whole board
+       to ~50 mean / ~23 std -- exactly the harvest crop distribution the tile
+       classifier was trained on -- so we KEEP it. Only the bright centre .icon
+       contaminates ~7 board cells; hiding just it reproduces the clean harvest
+       render with no effect on autoplay or click pass-through. -->
+  <script>
+    (function () {
+      var t = setInterval(function () {
+        var e = document.getElementById('game');
+        var sr = e && e.shadowRoot;
+        if (!sr) return;
+        if (!sr.getElementById('ac-hide-unmute-icon')) {
+          var s = document.createElement('style');
+          s.id = 'ac-hide-unmute-icon';
+          s.textContent = '#unmute-overlay .icon{display:none !important;}'
+                          + '#unmute-overlay{pointer-events:none !important;}';
+          sr.appendChild(s);
+        }
+        var ic = sr.querySelector('#unmute-overlay .icon');
+        if (ic) ic.style.display = 'none';
+      }, 200);
+      setTimeout(function () { clearInterval(t); }, 15000);
+    })();
+  </script>
+</body>
+</html>
