@@ -138,6 +138,14 @@ class Bot:
         R, C = tiles.shape[:2]
         crops = np.stack([canon(tiles[r, c]) for r in range(R) for c in range(C)])
         if self.use_nn and self.nn is not None:
+            # The NN was trained on dim (~mean 50) harvest crops, but the live
+            # capture is bright (~mean 170) because the index.html veil isn't
+            # compositing into Page.captureScreenshot. Re-normalize to the
+            # training brightness so the NN is in-distribution (a no-op when the
+            # board is already dim). NCC is brightness-invariant -> no dim needed.
+            m = float(crops.mean())
+            if m > 1:
+                crops = (crops.astype(np.float32) * (50.0 / m)).clip(0, 255).astype(np.uint8)
             self._sim = self.nn.sim_matrix(crops).reshape(R, C, R, C)
         else:
             self._sim = self._ncc_matrix(crops, R, C)
