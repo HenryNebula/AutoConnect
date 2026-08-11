@@ -176,6 +176,43 @@ static double py_rollout_clear_rate(py::array_t<bool> present_arr,
 }
 
 // ===========================================================================
+// 2b) rollout_mean_steps -- mean removal-steps per rollout (whether it clears
+//     or deadlocks). Predicts rollout TIME (per-step cost is constant), i.e.
+//     the rollout-length inflation from a soft/permissive backbone.
+// ===========================================================================
+static double py_rollout_mean_steps(py::array_t<bool> present_arr,
+                                    py::array_t<float> sim_arr,
+                                    double thr, int K, int seed) {
+    auto bp = present_arr.request();
+    auto bs = sim_arr.request();
+    if (bp.ndim != 2) throw std::runtime_error("present must be 2D");
+    int R = (int)bp.shape[0], C = (int)bp.shape[1];
+    const uint8_t *present0 = (const uint8_t *)bp.ptr;
+    const float *sim = (const float *)bs.ptr;
+    if (K <= 0) K = 1;
+    std::mt19937 rng((unsigned)seed);
+    std::vector<uint8_t> cur((size_t)R * C);
+    int init_left = 0;
+    for (int i = 0; i < R * C; i++) init_left += present0[i] ? 1 : 0;
+    float fthr = (float)thr;
+    long total_steps = 0;
+    for (int k = 0; k < K; k++) {
+        std::copy(present0, present0 + (size_t)R * C, cur.begin());
+        int left = init_left, steps = 0;
+        while (left > 0) {
+            int r1, c1, r2, c2;
+            if (!random_same_pair(cur.data(), R, C, sim, fthr, rng, r1, c1, r2, c2)) break;
+            cur[(size_t)r1 * C + c1] = 0;
+            cur[(size_t)r2 * C + c2] = 0;
+            left -= 2;
+            ++steps;
+        }
+        total_steps += steps;
+    }
+    return (double)total_steps / (double)K;
+}
+
+// ===========================================================================
 // 3) solvable (exact, endgame) -- port of bot.py _solvable
 // ===========================================================================
 static bool solvable_rec(uint8_t *cur, int R, int C, const float *sim, float thr,
@@ -245,6 +282,10 @@ PYBIND11_MODULE(conn_fast, m) {
           py::arg("present"), py::arg("sim"), py::arg("thr"),
           py::arg("K"), py::arg("seed"),
           "Monte-Carlo clear probability: K random same-type completions.");
+    m.def("rollout_mean_steps", &py_rollout_mean_steps,
+          py::arg("present"), py::arg("sim"), py::arg("thr"),
+          py::arg("K"), py::arg("seed"),
+          "Mean removal-steps per rollout (predicts rollout time).");
     m.def("solvable", &py_solvable,
           py::arg("present"), py::arg("sim"), py::arg("thr"),
           py::arg("max_depth") = 0, py::arg("topk") = 0,
