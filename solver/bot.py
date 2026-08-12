@@ -1,19 +1,20 @@
-"""Legitimate runtime bot: perceive the board by CV, solve with my own
-connectivity algorithm, and act via CDP mouse clicks. No game state is read
-for gameplay decisions.
+"""Legitimate runtime bot: perceive the board by CV (a trained PairNet tile
+classifier), solve with my own <=2-turn connectivity algorithm, and act via the
+SWF's ``acRemovePair`` ExternalInterface handle (a CDP-click fallback exists but
+is rarely needed). No game state is read for the pairing DECISION -- only the
+game's tilesLeft count, as an acceptance signal.
 
-Per move the board is RE-PERCEIVED from pixels (so tile-drift levels, where the
-game shifts tiles after each move, are handled): find a connectable same-icon
-pair with my <=2-turn connector + one-ply deadlock lookahead, CDP-click it, then
-re-perceive and confirm the tile count dropped by two (the game's own acceptance
-signal -- equivalent to a human seeing the pair clear). A non-decreasing count
-means a mis-classification: that pair is remembered as "known different" and the
-bot re-picks. The board state is never read from the game.
+The grid is detected once per level and tiles are snapshotted once: the level
+"movement" mechanics are layout-only (tiles sit on a fixed lattice and do NOT
+drift mid-level), so the per-move sim matrix + classifier reuse that snapshot,
+masking removed cells via the present mask. Each removal is confirmed by
+tilesLeft dropping; a non-drop means a mis-classification -- that pair is
+remembered as "known different" and the bot re-picks. On a genuine deadlock (no
+progress for a stretch) the SWF reshuffles (acPlayOne -> createNewMap) and the
+board is re-snapshotted.
 
-Level/game transitions are driven as control handles (see ``advance``): while
-developing, the working SWF's ExternalInterface continue/restart callbacks are
-used; for the final vanilla run these are replaced by CDP clicks on the result
-buttons (same control actions, no state read).
+Level/game transitions are driven as control handles (see ``advance``): the
+patched SWF's ExternalInterface callbacks (acSetEnabled/acReset/acStep) are used.
 """
 from __future__ import annotations
 import json
@@ -27,6 +28,10 @@ import cv2
 import cdp
 import vision
 import conn
+try:
+    import conn_fast as _cf   # compiled rollout/exact lookahead (solver/cpp/build.sh)
+except Exception:             # noqa: BLE001
+    _cf = None
 import gallery as galmod
 
 CANON = galmod.CANON
@@ -65,12 +70,25 @@ class Bot:
         self.empty_thr = 0.55          # NCC >= this => cell is an empty slot
         self.std_thr = 60.0            # icon-std floor (learned at level start)
         self._recover_count = 0        # deadlock-reshuffle attempts this level
+        self.use_remove_pair = None    # cached _has_ei("acRemovePair"); None=unprobed
         # Learned same-type tile classifier (issue #3): the trained PairNet is a
         # drop-in scoring function for gallery.color_ncc. If no model is present
         # (or torch is missing) the bot falls back to colour-NCC, unchanged.
         self.nn = self._maybe_load_nn(model_path)
         self.use_nn = self.nn is not None and getattr(self.nn, "available", False)
         self.cand_thr = 0.5 if self.use_nn else 0.55   # NN prob vs NCC score
+        # C++ lookahead policy (solver/cpp/conn_fast.cpp); no-op when _cf is None
+        self.rollout_k = 40        # Monte-Carlo rollouts per candidate move
+        self.rollout_m = 6         # top-N candidates evaluated by lookahead
+        self.exact_tiles = 20      # <= this many tiles -> exact solvable (else rollout)
+        self.safe_thr = 0.10       # rollout clear-rate floor: below this a move
+                                   # is treated as deadlock-prone and skipped
+        self.use_rollout = False   # C++ rollout lookahead (needs reshuffle +
+                                   # stable session to benefit live); False keeps
+                                   # the proven greedy + _ncc_safe path
+        self.max_reshuffles = 6    # deadlock recoveries per level (acPlayOne ->
+                                   # SWF createNewMap) before giving up
+        self._cf_counter = 0       # per-call seed source for reproducible rollouts
         self._sim = None            # cached all-pairs tile-sim matrix (NN only)
         self._sim_tiles = None      # id(self.cur_tiles) the cache belongs to
 
@@ -109,21 +127,45 @@ class Bot:
 
     def _ensure_sim(self):
         """Pre-compute the all-pairs tile-similarity matrix for the current board
-        once per move (one batched NN forward). Subsequent per-pair lookups in
-        _pick_move / lookahead are then cheap array indexing. The NCC fallback
-        skips this and keeps scoring per-pair, as before (an O(n^2) NCC matrix
-        would be slower than scoring only the connectable pairs)."""
+        once per level, from whichever backbone is active: a batched NN forward
+        (self.nn) or a pairwise colour-NCC matrix. Either way subsequent per-pair
+        lookups in _pick_move / the rollout lookahead are cheap array indexing --
+        this is what makes the vision backbone swappable."""
         tiles = self.cur_tiles
-        if (not self.use_nn) or tiles is None or tiles is self._sim_tiles:
+        if tiles is None or tiles is self._sim_tiles:
             return
         self._sim_tiles = tiles
         R, C = tiles.shape[:2]
         crops = np.stack([canon(tiles[r, c]) for r in range(R) for c in range(C)])
-        self._sim = self.nn.sim_matrix(crops).reshape(R, C, R, C)
+        if self.use_nn and self.nn is not None:
+            # The NN was trained on dim (~mean 50) harvest crops, but the live
+            # capture is bright (~mean 170) because the index.html veil isn't
+            # compositing into Page.captureScreenshot. Re-normalize to the
+            # training brightness so the NN is in-distribution (a no-op when the
+            # board is already dim). NCC is brightness-invariant -> no dim needed.
+            m = float(crops.mean())
+            if m > 1:
+                crops = (crops.astype(np.float32) * (50.0 / m)).clip(0, 255).astype(np.uint8)
+            self._sim = self.nn.sim_matrix(crops).reshape(R, C, R, C)
+        else:
+            self._sim = self._ncc_matrix(crops, R, C)
+
+    def _ncc_matrix(self, crops, R, C):
+        """All-pairs colour-NCC similarity as an (R,C,R,C) float32 matrix, built
+        once per level. Makes the NCC backbone as cheap to query as the NN
+        (matrix-indexed _pair_sim + rollout lookahead) -- ~0.2s for a 96-tile
+        board, amortised over the whole level."""
+        n = len(crops)
+        flat = np.zeros((n, n), dtype=np.float32)
+        for i in range(n):
+            for j in range(i + 1, n):
+                v = galmod.color_ncc(crops[i], crops[j])
+                flat[i, j] = flat[j, i] = v
+        return flat.reshape(R, C, R, C)
 
     def _pair_sim(self, a, b):
-        """Same-type score in [0,1] for cells a=(r,c), b=(r,c). NN probability
-        when a model is loaded, else colour-NCC (issue #3's old classifier)."""
+        """Same-type score in [0,1] for cells a=(r,c), b=(r,c), from the cached
+        sim matrix (NN probability or colour-NCC, whichever backbone is active)."""
         if self._sim is not None:
             return float(self._sim[a[0], a[1], b[0], b[1]])
         return galmod.color_ncc(canon(self.cur_tiles[a[0], a[1]]),
@@ -225,6 +267,22 @@ class Bot:
     def present_via_std(self, img):
         return self._cell_stds(img) > self.std_thr
 
+    def present_by_count(self, img, n):
+        """Present mask = the n highest-std cells (icons are colourful -> high
+        std; empty cells uniform -> low std). Ranks instead of using an absolute
+        threshold, so it is immune to the dim/veiled board state -- used to
+        re-perceive a PARTIAL board after a reshuffle, where present_via_std's
+        full-board-calibrated threshold misreads. ``n`` is the game's tilesLeft."""
+        stds = self._cell_stds(img)
+        total = stds.size
+        if n >= total:
+            return np.ones(stds.shape, dtype=bool)
+        if n <= 0:
+            return np.zeros(stds.shape, dtype=bool)
+        # threshold = the nth-highest std; >= keeps the top-n (plus any ties)
+        thr = np.partition(stds.flatten(), total - n)[total - n]
+        return stds >= thr
+
     def classify_present(self, img, present):
         """Label every present cell (gallery NN; unseen grouped by colour-NCC)."""
         g = self.grid
@@ -274,26 +332,6 @@ class Bot:
             out.append(remap[x])
         return out
 
-    def _count_drift_changes(self, img_a, img_b, present, exclude, thr=60):
-        """Count present cells (excluding ``exclude``) whose pixels changed by
-        more than ``thr`` between two frames -- the signature of tile drift.
-        Vectorised over the whole board."""
-        g = self.grid
-        ts = g["ts"]
-        h = int(ts * 0.45)
-        dif = np.abs(img_a.astype(np.int16) - img_b.astype(np.int16)).sum(2)
-        excl = set(exclude)
-        cnt = 0
-        for r in range(g["rows"]):
-            for c in range(g["cols"]):
-                if not present[r, c] or (r, c) in excl:
-                    continue
-                cy, cx = g["ys"][r], g["xs"][c]
-                win = dif[int(cy - h):int(cy + h), int(cx - h):int(cx + h)]
-                if win.size and win.mean() > thr:
-                    cnt += 1
-        return cnt
-
     def _cell_change(self, img_a, img_b, r, c):
         g = self.grid
         ts = g["ts"]
@@ -337,12 +375,36 @@ class Bot:
                 return 99
         return 99
 
+    def _ei_remove_ok(self):
+        """True if the patched SWF exposes the acRemovePair EI handle (probed once)."""
+        if self.use_remove_pair is None:
+            self.use_remove_pair = bool(_has_ei("acRemovePair"))
+        return self.use_remove_pair
+
     def _click_pair_removes(self, r1, c1, r2, c2, retries=3):
-        """Click a pair and confirm removal by the game's tile count dropping.
-        Retries the full two-click sequence -- the first few post-load CDP
-        clicks often don't register (cold path), so a no-removal is not proof
-        the pair is wrong. Returns True if the game removed the pair."""
-        for _ in range(retries):
+        """Remove a pair and confirm by the game's tile count dropping.
+
+        Uses the SWF's ``acRemovePair`` ExternalInterface handle when available
+        (instant, deterministic -- bypasses the lossy headless-canvas click
+        path); falls back to CDP clicks otherwise. Returns True if removed."""
+        if self._ei_remove_ok():
+            # SWF board has a 1-cell -1 border: name myicon_x{X}y{Y}, X=col, Y=row.
+            # acRemovePair is deterministic, so a single attempt suffices: a fail
+            # means the pair isn't truly same-type, and the caller blacklists it /
+            # eventually reshuffles. Poll tilesLeft until it drops (accepted) or
+            # verify_wait elapses -- returns as soon as the removal lands instead
+            # of always waiting the full verify_wait.
+            tl0 = self._tiles_left()
+            if tl0 < 2:
+                return True
+            _player_call("acRemovePair", c1 + 1, r1 + 1, c2 + 1, r2 + 1)
+            deadline = time.time() + self.verify_wait
+            while time.time() < deadline:
+                if self._tiles_left() < tl0:
+                    return True
+                time.sleep(0.03)
+            return False
+        for _ in range(retries):                       # fallback: lossy CDP clicks
             tl0 = self._tiles_left()
             if tl0 < 2:
                 return True
@@ -354,20 +416,66 @@ class Bot:
                 return True
         return False
 
-    def clear_board(self, max_moves=140):
-        """Clear the current board, drift-safe and fast.
+    def _sync_present(self):
+        """Re-snapshot and re-derive the present mask + tiles after a board
+        change (drift, an external move, or a reshuffle). Uses present_by_count
+        (top-tilesLeft by std) so it stays accurate on PARTIAL boards, where
+        present_via_std's full-board threshold fails. Returns None if grid lost."""
+        if not self.establish_grid():
+            return None
+        img = self.snap()
+        self.cur_tiles = vision.extract_tiles(img, self.grid)
+        return self.present_by_count(img, self._tiles_left())
 
-        A move is chosen by the tile classifier (trained PairNet, else colour-
-        NCC) over connectable pairs; each removal is confirmed by the GAME's
-        tile count dropping (``acStatus`` tilesLeft), with click retries for the
-        cold post-load click path. Present is tracked from confirmed removals
-        (stable); ``present_via_std`` is only re-derived on a perceived deadlock,
-        since mid-clear animations make per-frame std unreliable.
+    def _try_reshuffle(self, present):
+        """Stuck-recovery (no progress for a while): re-derive present from
+        pixels; if a genuine move appears, return the fresh present (it was
+        drift / a transient false-positive run). Otherwise the board is
+        deadlocked -> trigger the SWF's reshuffle (acPlayOne -> createNewMap
+        when no pair exists) within the per-level cap and return the post-
+        reshuffle present. Return None to give up (cap reached / grid lost)."""
+        present = self._sync_present()
+        if present is None:
+            return None
+        if not present.any() or self._tiles_left() < 2:
+            return present                       # cleared
+        if self._pick_move(present) is not None:
+            return present                       # was drift / transient
+        if self._recover_count >= self.max_reshuffles:
+            if self.verbose:
+                print(f"[bot] deadlock; reshuffle cap ({self.max_reshuffles}) "
+                      f"reached", flush=True)
+            return None
+        self._recover_count += 1
+        tl0 = self._tiles_left()
+        _player_call("acPlayOne")                 # createNewMap when deadlocked
+        time.sleep(1.5)                            # let the reshuffle render settle
+        present = self._sync_present()
+        if present is None:
+            return None
+        if self.verbose:
+            print(f"[bot] deadlock at {tl0} tiles -> reshuffle "
+                  f"#{self._recover_count} ({int(present.sum())} tiles)", flush=True)
+        return present
+
+    def clear_board(self, max_moves=140):
+        """Clear the current board, fast.
+
+        Grid + tiles are snapshotted ONCE (tiles don't drift mid-level -- the
+        level mechanics are layout-only); the sim matrix is built once and the
+        per-move classifier just masks removed cells via ``present``. Each
+        removal is confirmed by the GAME's tilesLeft dropping; a non-drop means
+        a mis-classification (the pair is blacklisted). On a deadlock the SWF
+        reshuffles (acPlayOne -> createNewMap) and the board is re-snapshotted.
         """
         if not self.establish_grid():
             return False, 0
         img = self.snap()
         self.learn_std_threshold(img)
+        # Snapshot tiles ONCE for the level -- tiles don't drift (level mechanics
+        # are layout-only), so the sim matrix + classifier reuse this, masking
+        # removed cells via `present` instead of re-snapping every move.
+        self.cur_tiles = vision.extract_tiles(img, self.grid)
         self._recover_count = 0
         present = np.ones((self.grid["rows"], self.grid["cols"]), dtype=bool)
 
@@ -376,7 +484,6 @@ class Bot:
         for _ in range(15):
             if not present.any() or self._tiles_left() < 2:
                 break
-            self.cur_tiles = vision.extract_tiles(self.snap(), self.grid)
             mv = self._pick_move(present)
             if mv is None:
                 break
@@ -393,58 +500,44 @@ class Bot:
             if not present.any() or self._tiles_left() < 2:
                 cleared = True
                 break
-            self.cur_tiles = vision.extract_tiles(self.snap(), self.grid)
             mv = self._pick_move(present)
-            if mv is None:
-                fails += 1
-                if fails > 70:
-                    # No connectable pair among tracked-present cells. On a
-                    # static level that is a real deadlock; on a drift level
-                    # the tracked mask may be stale, so re-derive once from
-                    # pixels before giving up.
-                    img = self.snap()
-                    present = self.present_via_std(img)
-                    if not present.any() or self._tiles_left() < 2:
-                        cleared = True
-                        break
-                    if self.verbose:
-                        print(f"[bot] stuck (deadlock); {int(present.sum())} left")
-                    break
+            progressed = False
+            if mv is not None:
+                (r1, c1), (r2, c2) = mv
+                if self._click_pair_removes(r1, c1, r2, c2):
+                    moves += 1
+                    fails = 0
+                    progressed = True
+                    present[r1, c1] = False
+                    present[r2, c2] = False
+                    if moves % 12 == 0 and self.verbose:
+                        print(f"[bot] {moves} moves, {int(present.sum())} left", flush=True)
+                else:
+                    # acRemovePair is deterministic: a fail means the pair isn't
+                    # truly same-type (NN false positive). Blacklist it; if this
+                    # keeps happening the board is effectively deadlocked for us.
+                    self.known_diff.add(frozenset(((r1, c1), (r2, c2))))
+            if progressed:
                 continue
-            (r1, c1), (r2, c2) = mv
-            if self._click_pair_removes(r1, c1, r2, c2):
-                moves += 1
-                fails = 0
-                present[r1, c1] = False
-                present[r2, c2] = False
-                if moves % 12 == 0 and self.verbose:
-                    print(f"[bot] {moves} moves, {int(present.sum())} left", flush=True)
-            else:
-                self.known_diff.add(frozenset(((r1, c1), (r2, c2))))
-                fails += 1
-                if fails % 20 == 0:
-                    # Stall recovery: the CDP click path is intermittently flaky,
-                    # so good pairs can get wrongly blacklisted in known_diff and
-                    # a tile selection can stick. Reset both, then re-warm clicks.
-                    self.known_diff.clear()
-                    empties = [(r, c) for r in range(present.shape[0])
-                               for c in range(present.shape[1]) if not present[r, c]]
-                    if empties:
-                        er, ec = empties[0]
-                        self.click_cell(er, ec)
-                        time.sleep(0.2)
-                    if self.verbose:
-                        print(f"[bot] stall recovery at {moves} moves (fails={fails}): "
-                              f"cleared known_diff, reset selection", flush=True)
-                elif self.verbose and fails % 10 == 0:
-                    print(f"[bot] ...stalled: {moves} moves done, {fails} fails, "
-                          f"tilesLeft={self._tiles_left()} present={int(present.sum())}",
-                          flush=True)
-                if fails > 80:
-                    if self.verbose:
-                        print(f"[bot] too many fails; aborting at {int(present.sum())}",
-                              flush=True)
-                    break
+            fails += 1
+            if fails and fails % 20 == 0:
+                self.known_diff.clear()
+                if self.verbose:
+                    print(f"[bot] ...stalled: {moves} moves, fails={fails}, "
+                          f"tilesLeft={self._tiles_left()}", flush=True)
+            if fails < 15:
+                continue
+            # Stuck -- no progress for ~15 attempts (no move found, or every
+            # candidate is a false positive). Re-derive present; reshuffle if
+            # genuinely deadlocked (acPlayOne -> createNewMap), then resume.
+            present = self._try_reshuffle(present)
+            if present is None:
+                break
+            self.known_diff.clear()
+            fails = 0
+            if not present.any() or self._tiles_left() < 2:
+                cleared = self._tiles_left() < 2
+                break
         if not cleared:
             cleared = self._tiles_left() < 2
         if self.verbose:
@@ -516,14 +609,41 @@ class Bot:
                 continue
         return False
 
+    def _cf_safety(self, present, pair):
+        """Lookahead safety score in [0,1] for removing `pair` (1 = leaves a
+        clearable board, 0 = doomed): exact solvable in the endgame, else the
+        Monte-Carlo clear-rate over rollout_k random completions. Returns -1 if
+        the C++ extension or NN sim matrix is unavailable (caller falls back to
+        _ncc_safe)."""
+        if _cf is None or self._sim is None:
+            return -1.0
+        (r1, c1), (r2, c2) = pair
+        p2 = present.copy()
+        p2[r1, c1] = False
+        p2[r2, c2] = False
+        if int(p2.sum()) == 0:
+            return 1.0
+        if int(p2.sum()) <= self.exact_tiles:
+            return 1.0 if _cf.solvable(p2, self._sim, self.cand_thr, 0, 12) else 0.0
+        self._cf_counter += 1
+        return float(_cf.rollout_clear_rate(p2, self._sim, self.cand_thr,
+                                             self.rollout_k, self._cf_counter))
+
     def _pick_move(self, present):
-        """Pick the highest-scoring connectable same-icon pair (the tile
-        classifier), skipping game-rejected pairs. The classifier is the trained
-        PairNet when available (issue #3), else colour-NCC."""
+        """Pick the best connectable same-icon pair (the tile classifier),
+        skipping game-rejected pairs. When the C++ lookahead is available, the
+        top candidates are ranked by Monte-Carlo clear-rate (deep deadlock
+        avoidance) / exact solvable in the endgame; otherwise the 1-ply
+        _ncc_safe heuristic. Classifier = trained PairNet when available
+        (issue #3), else colour-NCC."""
         self._ensure_sim()
+        use_cf = self.use_rollout and _cf is not None and self._sim is not None
         cands = []
         any_mv = None
-        for (a, b) in conn.all_connectable_pairs_anylabel(present):
+        enum = (((int(a), int(b)), (int(c), int(d)))
+                for a, b, c, d in _cf.connectable_pairs(present)) if use_cf \
+            else conn.all_connectable_pairs_anylabel(present)
+        for (a, b) in enum:
             if frozenset((a, b)) in self.known_diff:
                 continue
             any_mv = (a, b) if any_mv is None else any_mv
@@ -535,13 +655,21 @@ class Bot:
                 cands.append((v, (a, b)))
         cands.sort(reverse=True)
         if cands:
-            # Prefer a move that doesn't create a deadlock: among the top
-            # candidates, return the first whose removal leaves a board that
-            # still has a connectable same-type pair (1-ply, cheap on large
-            # boards via _ncc_safe; exact _solvable on small ones). Pure-greedy
-            # move order otherwise deadlocks ~1-in-10 layouts. Fall back to the
-            # top-scoring pair if none of the top candidates is provably safe.
-            for _v, pair in cands[:6]:
+            top = cands[:(self.rollout_m if use_cf else 6)]
+            if use_cf:
+                # rollout as a deadlock FILTER, not a ranking: clear-rate is
+                # reliable for "this move dooms the board" (~0) but noisy for
+                # ranking good moves. So drop deadlock-prone candidates, then pick
+                # the highest-sim survivor (greedy on true positives -- strong on
+                # clearable boards, where this reduces to pure greedy). If every
+                # candidate looks doomed, take the least-bad clear-rate.
+                scored = [(self._cf_safety(present, pair), v, pair) for v, pair in top]
+                safe = [t for t in scored if t[0] >= self.safe_thr]
+                if safe:
+                    return max(safe, key=lambda t: t[1])[2]      # highest sim
+                return max(scored, key=lambda t: t[0])[2]        # least-bad rate
+            # Python fallback: first _ncc_safe candidate, else top-scoring
+            for _v, pair in top:
                 if self._ncc_safe(present, pair):
                     return pair
             return cands[0][1]
@@ -601,9 +729,50 @@ class Bot:
         pass
 
     # ---- full game --------------------------------------------------------
-    def play_game(self, runs=3, max_level=13, per_level_timeout=260.0):
+    def _restart_session(self):
+        """Restart the headless game session (chrome+Xvfb via session.sh) between
+        successful runs to reset the Ruffle renderer, which degrades after
+        ~15-20 min of continuous play and breaks grid detection (issue #2). The
+        HTTP server persists across this (session.sh only manages chrome+Xvfb).
+        Each run then starts from a fresh renderer, well under the window."""
+        import subprocess
+        here = os.path.dirname(os.path.abspath(__file__))
+        sh = os.path.join(here, "session.sh")
+        env = {**os.environ, "DISPLAY": os.environ.get("DISPLAY", ":99")}
+        for cmd in ([sh, "stop"], [sh, "start"]):
+            try:
+                subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=90)
+            except Exception as e:  # noqa: BLE001
+                if self.verbose:
+                    print(f"[run] session {cmd[-1]} error: {e!r}")
+            time.sleep(2.0)
+        # Robustly wait for chrome to come back + the EI bridge to register.
+        # cdp._send can raise while chrome is mid-startup; tolerate and retry.
+        deadline = time.time() + 90.0
+        ready = False
+        while time.time() < deadline:
+            try:
+                if Bot._wait_player(timeout=5.0):
+                    ready = True
+                    break
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(1.0)
+        if not ready:
+            raise RuntimeError("EI bridge did not come back after session restart")
+        time.sleep(4.0)  # let the SWF settle into a playable state
+        if self.verbose:
+            print("[run] session restarted; renderer reset", flush=True)
+
+    def play_game(self, runs=3, max_level=13, per_level_timeout=260.0, restart_between=True):
         clears = 0
         for run in range(runs):
+            if run > 0 and restart_between:
+                # only reached if the previous run succeeded (a failure breaks)
+                if self.verbose:
+                    print("\n[run] restarting session to reset the renderer before the next run", flush=True)
+                self._restart_session()
             if self.verbose:
                 print(f"\n=== RUN {run+1}/{runs} ===")
             self.reset_grid()
@@ -634,7 +803,8 @@ class Bot:
                     print(f"[run] RUN {run+1} CLEARED all {max_level} levels ✓ (clears={clears})")
             else:
                 if self.verbose:
-                    print(f"[run] RUN {run+1} failed at level {level}")
+                    print(f"[run] RUN {run+1} failed at level {level} -- stopping (fail-fast)")
+                break  # FAIL FAST: don't restart/continue on a failed run
         if self.verbose:
             print(f"\n=== {clears}/{runs} runs fully cleared ===")
         return clears
@@ -674,9 +844,22 @@ def main():
     ap.add_argument("--model", default=None,
                     help="path to a trained PairNet .pt (default: siamese micro)")
     ap.add_argument("-q", action="store_true")
+    ap.add_argument("--rollout", action="store_true",
+                    help="enable the C++ rollout lookahead (conn_fast)")
+    ap.add_argument("--ncc", action="store_true",
+                    help="use colour-NCC as the tile backbone (skip the NN model)")
     args = ap.parse_args()
     bot = Bot(args.gallery, verbose=not args.q, transition_mode=args.transition,
               model_path=args.model)
+    if args.rollout:
+        bot.use_rollout = True
+    if args.ncc:
+        # NCC backbone: skip the NN, use a higher same-type threshold for precision
+        # (NCC>=0.8 is guaranteed same-type; the NN's 0.5 is too low for NCC).
+        bot.use_nn = False
+        bot.nn = None
+        bot.cand_thr = 0.7
+        print("[bot] backbone = colour-NCC (cand_thr=0.7)")
     bot.play_game(args.runs, args.max_level)
 
 

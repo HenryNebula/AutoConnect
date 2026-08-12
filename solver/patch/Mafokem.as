@@ -196,6 +196,7 @@ package kawai2_fla
       public var acEnabled:Boolean;
       public var acInterval:uint;
       public var acLastFail:String;
+      public var acRegErr:String = "";
 
       public function Mafokem()
       {
@@ -1997,7 +1998,7 @@ package kawai2_fla
          }
          acClears = 0;
          acFails = 0;
-         acEnabled = true;
+         acEnabled = false;
          acInterval = 200;
          if(ExternalInterface.available)
          {
@@ -2009,8 +2010,9 @@ package kawai2_fla
                ExternalInterface.addCallback("acGetClears", acGetClears);
                ExternalInterface.addCallback("acStep", acStep);
                ExternalInterface.addCallback("acPlayOne", acPlayOneVoid);
+               ExternalInterface.addCallback("acRemovePair", acRemovePair);
             }
-            catch(e:*) {}
+            catch(e:*) { acRegErr = "reg:" + String(e); }
          }
          acTimer = new Timer(acInterval);
          acTimer.addEventListener(TimerEvent.TIMER, acTick);
@@ -2084,7 +2086,7 @@ package kawai2_fla
          }
          catch(e:*) {}
          scene = onResult ? "result" : "play";
-         return '{"level":' + zuho + ',"maxLevel":' + hijo + ',"score":' + score + ',"tilesLeft":' + tilesLeft + ',"scene":"' + scene + '","reason":"' + shibaiyuanyin + '","clears":' + acClears + ',"fails":' + acFails + ',"ei":' + ei + ',"timeLeft":' + stotaltime + ',"shuffles":' + lasinus + ',"hints":' + zyvonyg + ',"lastFail":"' + acLastFail + '"}';
+         return '{"level":' + zuho + ',"maxLevel":' + hijo + ',"score":' + score + ',"tilesLeft":' + tilesLeft + ',"scene":"' + scene + '","reason":"' + shibaiyuanyin + '","clears":' + acClears + ',"fails":' + acFails + ',"ei":' + ei + ',"timeLeft":' + stotaltime + ',"shuffles":' + lasinus + ',"hints":' + zyvonyg + ',"lastFail":"' + acLastFail + '","regErr":"' + acRegErr + '"}';
       }
 
       public function acStep() : String
@@ -2166,6 +2168,26 @@ package kawai2_fla
          else if(!roviga(vum.nidi))
          {
             createNewMap(null);
+         }
+      }
+
+      public function acRemovePair(x1:*, y1:*, x2:*, y2:*) : void
+      {
+         var c1:MovieClip = mebyhuham.getChildByName("myicon_x" + x1 + "y" + y1) as MovieClip;
+         var c2:MovieClip = mebyhuham.getChildByName("myicon_x" + x2 + "y" + y2) as MovieClip;
+         if(c1 && c2)
+         {
+            if(rejorij)
+            {
+               rejorij.light.visible = false;
+            }
+            if(fofih)
+            {
+               fofih.light.visible = false;
+            }
+            rejorij = c1;
+            fofih = c2;
+            byqij();
          }
       }
 
