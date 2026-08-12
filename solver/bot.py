@@ -729,9 +729,50 @@ class Bot:
         pass
 
     # ---- full game --------------------------------------------------------
-    def play_game(self, runs=3, max_level=13, per_level_timeout=260.0):
+    def _restart_session(self):
+        """Restart the headless game session (chrome+Xvfb via session.sh) between
+        successful runs to reset the Ruffle renderer, which degrades after
+        ~15-20 min of continuous play and breaks grid detection (issue #2). The
+        HTTP server persists across this (session.sh only manages chrome+Xvfb).
+        Each run then starts from a fresh renderer, well under the window."""
+        import subprocess
+        here = os.path.dirname(os.path.abspath(__file__))
+        sh = os.path.join(here, "session.sh")
+        env = {**os.environ, "DISPLAY": os.environ.get("DISPLAY", ":99")}
+        for cmd in ([sh, "stop"], [sh, "start"]):
+            try:
+                subprocess.run(cmd, env=env, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=90)
+            except Exception as e:  # noqa: BLE001
+                if self.verbose:
+                    print(f"[run] session {cmd[-1]} error: {e!r}")
+            time.sleep(2.0)
+        # Robustly wait for chrome to come back + the EI bridge to register.
+        # cdp._send can raise while chrome is mid-startup; tolerate and retry.
+        deadline = time.time() + 90.0
+        ready = False
+        while time.time() < deadline:
+            try:
+                if Bot._wait_player(timeout=5.0):
+                    ready = True
+                    break
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(1.0)
+        if not ready:
+            raise RuntimeError("EI bridge did not come back after session restart")
+        time.sleep(4.0)  # let the SWF settle into a playable state
+        if self.verbose:
+            print("[run] session restarted; renderer reset", flush=True)
+
+    def play_game(self, runs=3, max_level=13, per_level_timeout=260.0, restart_between=True):
         clears = 0
         for run in range(runs):
+            if run > 0 and restart_between:
+                # only reached if the previous run succeeded (a failure breaks)
+                if self.verbose:
+                    print("\n[run] restarting session to reset the renderer before the next run", flush=True)
+                self._restart_session()
             if self.verbose:
                 print(f"\n=== RUN {run+1}/{runs} ===")
             self.reset_grid()
@@ -762,7 +803,8 @@ class Bot:
                     print(f"[run] RUN {run+1} CLEARED all {max_level} levels ✓ (clears={clears})")
             else:
                 if self.verbose:
-                    print(f"[run] RUN {run+1} failed at level {level}")
+                    print(f"[run] RUN {run+1} failed at level {level} -- stopping (fail-fast)")
+                break  # FAIL FAST: don't restart/continue on a failed run
         if self.verbose:
             print(f"\n=== {clears}/{runs} runs fully cleared ===")
         return clears
