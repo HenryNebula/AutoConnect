@@ -11,7 +11,11 @@
       autoplay: "on",
       unmuteOverlay: "visible",
       backgroundColor: "#000000",
-      publicPath: "ruffle/"
+      publicPath: "ruffle/",
+      // Force the 2D-canvas renderer. The default wgpu-webgl renderer paints to a
+      // WebGL canvas whose buffer isn't preserved, so canvas.toDataURL (how the
+      // CV backend reads the board) reads back BLANK. The 2D canvas is readable.
+      preferredRenderer: "canvas"
     };
   </script>
   <script src="ruffle/ruffle.js"></script>

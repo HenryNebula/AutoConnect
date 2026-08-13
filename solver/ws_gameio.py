@@ -35,9 +35,17 @@ from concurrent.futures import Future, TimeoutError as _FutureTimeout
 from typing import Any
 
 import numpy as np
+import cv2
 from PIL import Image
 
 import gameio  # frozen GameIO contract (Branch B)
+
+# Canonical capture width. vision.detect_grid's blob-size thresholds
+# (area<6000, w/h<70) are absolute pixels, tuned for a ~720px-wide board. A
+# full-size browser renders the Ruffle canvas 2-3x larger, so captures are
+# normalized to this width; the scale factor maps brain coords back onto the
+# live canvas for the overlay (see capture / draw_overlay).
+CANON_CAPTURE_W = 720
 
 
 # Request methods the patched SWF + Ruffle expose once "ready" is signalled.
@@ -87,6 +95,10 @@ class WSGameIO(gameio.GameIO):
         # of enqueueing onto a dead socket.
         self._closed = False
 
+        # Capture -> 720-wide scale factor (brain-space -> canvas-space), so the
+        # bbox overlay aligns with tiles on the browser's full-size canvas.
+        self._cap_scale = 1.0
+
     # ---- public GameIO surface -------------------------------------------
 
     def capture(self) -> np.ndarray:
@@ -105,7 +117,20 @@ class WSGameIO(gameio.GameIO):
             )
         buf = base64.b64decode(data_url.split(",", 1)[1])
         pil = Image.open(io.BytesIO(buf)).convert("RGB")
-        return np.asarray(pil, dtype=np.uint8)
+        arr = np.asarray(pil, dtype=np.uint8)
+        if not getattr(self, "_logged_cap", False):
+            print(f"[ws_gameio] raw capture {arr.shape} mean={arr.mean():.0f} "
+                  f"(bright board ~170, blank ~0)", flush=True)
+            self._logged_cap = True
+        # Normalize to the canonical width the CV was tuned on: detect_grid's
+        # blob thresholds are absolute pixels, so a full-size browser canvas
+        # (tiles 2-3x larger) would be rejected. Remember the scale so draw_overlay
+        # can map brain coords back onto the live canvas.
+        oh, ow = arr.shape[:2]
+        ch = max(1, round(oh * CANON_CAPTURE_W / ow))
+        arr = cv2.resize(arr, (CANON_CAPTURE_W, ch), interpolation=cv2.INTER_AREA)
+        self._cap_scale = ow / float(CANON_CAPTURE_W)
+        return arr
 
     def status(self) -> dict:
         return self._request({"type": "status"})
@@ -131,7 +156,12 @@ class WSGameIO(gameio.GameIO):
         self._request({"type": "reset"})
 
     def draw_overlay(self, boxes: list[dict]) -> None:
-        self._request({"type": "overlay", "boxes": list(boxes or [])})
+        # Brain coords are in the 720-wide capture space; scale back onto the
+        # browser's full-size canvas so the overlay lines up with the tiles.
+        s = self._cap_scale
+        out = [{**b, "x": b["x"] * s, "y": b["y"] * s,
+                "w": b["w"] * s, "h": b["h"] * s} for b in (boxes or [])]
+        self._request({"type": "overlay", "boxes": out})
 
     def hide_overlay(self) -> None:
         self._request({"type": "hideOverlay"})
