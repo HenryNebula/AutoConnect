@@ -17,7 +17,6 @@ Level/game transitions are driven as control handles (see ``advance``): the
 patched SWF's ExternalInterface callbacks (acSetEnabled/acReset/acStep) are used.
 """
 from __future__ import annotations
-import json
 import os
 import sys
 import time
@@ -28,6 +27,7 @@ import cv2
 import cdp
 import vision
 import conn
+import gameio
 try:
     import conn_fast as _cf   # compiled rollout/exact lookahead (solver/cpp/build.sh)
 except Exception:             # noqa: BLE001
@@ -38,26 +38,13 @@ CANON = galmod.CANON
 DEFAULT_BG = np.array([53.0, 44.0, 26.0], dtype=np.float32)
 
 
-def _ev(expr):
-    r = cdp._send("Runtime.evaluate", {"expression": expr, "returnByValue": True})
-    return r.get("result", {}).get("value")
-
-
-def _player_call(method, *args):
-    a = ",".join(json.dumps(x) for x in args)
-    expr = ("(function(){var e=document.getElementsByTagName('ruffle-embed')[0];"
-            "if(!e||typeof e.%s!=='function')return undefined;"
-            "try{return e.%s(%s);}catch(x){return 'ERR:'+x;}})()" % (method, method, a))
-    return _ev(expr)
-
-
 def canon(crop):
     return cv2.resize(crop, (CANON, CANON), interpolation=cv2.INTER_AREA)
 
 
 class Bot:
     def __init__(self, gallery_path=None, verbose=True, transition_mode="ei",
-                 model_path=None):
+                 model_path=None, io=None):
         self.verbose = verbose
         self.grid = None
         self.bg = DEFAULT_BG.copy()
@@ -65,12 +52,17 @@ class Bot:
         self.known_diff = set()
         self.click_settle = 0.20
         self.verify_wait = 0.40
+        # Game I/O backend: CDPGameIO for the local-Chrome rig, WSGameIO for the
+        # LAN browser backend. The brain calls self.io.* and never imports cdp
+        # for game I/O (only the click-cell fallback still uses cdp directly).
+        # See solver/gameio.py.
+        self.io = io if io is not None else gameio.CDPGameIO(verify_wait=self.verify_wait)
         self.transition_mode = transition_mode   # "ei" (dev) or "click" (vanilla)
         self.empty_template = None     # learned empty-slot crop (CANON-sized)
         self.empty_thr = 0.55          # NCC >= this => cell is an empty slot
         self.std_thr = 60.0            # icon-std floor (learned at level start)
         self._recover_count = 0        # deadlock-reshuffle attempts this level
-        self.use_remove_pair = None    # cached _has_ei("acRemovePair"); None=unprobed
+        self.use_remove_pair = None    # cached io.has_ei("acRemovePair"); None=unprobed
         # Learned same-type tile classifier (issue #3): the trained PairNet is a
         # drop-in scoring function for gallery.color_ncc. If no model is present
         # (or torch is missing) the bot falls back to colour-NCC, unchanged.
@@ -183,9 +175,7 @@ class Bot:
 
     # ---- low level --------------------------------------------------------
     def snap(self):
-        p = os.path.join(os.environ.get("CLAUDE_JOB_DIR", "/tmp"), "tmp", "_bot.png")
-        cdp.capture(p)
-        return vision.load_img(p)
+        return self.io.capture()
 
     def click_cell(self, r, c):
         x, y = float(self.grid["xs"][c]), float(self.grid["ys"][r])
@@ -377,18 +367,12 @@ class Bot:
         per-cell pixel-diff, which is unreliable on the dim (~50) veiled board:
         the selection-light toggle and low-contrast removals both produce
         diff-40-ish false positives/negatives that desync the present mask."""
-        s = _player_call("acStatus")
-        if isinstance(s, str):
-            try:
-                return int(json.loads(s).get("tilesLeft", 99))
-            except Exception:  # noqa: BLE001
-                return 99
-        return 99
+        return int(self.io.status().get("tilesLeft", 99))
 
     def _ei_remove_ok(self):
         """True if the patched SWF exposes the acRemovePair EI handle (probed once)."""
         if self.use_remove_pair is None:
-            self.use_remove_pair = bool(_has_ei("acRemovePair"))
+            self.use_remove_pair = self.io.has_ei("acRemovePair")
         return self.use_remove_pair
 
     # ---- demo / visualization (--demo) -----------------------------------
@@ -400,41 +384,16 @@ class Bot:
     # Every call is try/except-guarded -- the overlay is cosmetic and must never
     # break a run.
     def _demo_show(self, boxes):
-        """Render the given boxes [{x,y,w,h,color,label?}] into #ac-demo-overlay.
-        Host is document.body (no transformed ancestor -> position:fixed stays
-        viewport-anchored and the max z-index beats the flattened shadow veil).
-        Fallback if a visual test shows the veil painting above: swap the host
-        for document.getElementsByTagName('ruffle-embed')[0].shadowRoot."""
+        """Render the given boxes [{x,y,w,h,color,label?}] via the I/O backend
+        (a DOM overlay on document.body for CDP; an overlay canvas in-browser)."""
         if not self.demo:
             return
-        js = """(function(boxes){
-var host=document.body;
-var ov=document.getElementById('ac-demo-overlay');
-if(!ov){ov=document.createElement('div');ov.id='ac-demo-overlay';
-ov.style.cssText='position:fixed;left:0;top:0;width:100vw;height:100vh;pointer-events:none;z-index:2147483647;margin:0;padding:0;';
-host.appendChild(ov);}
-ov.innerHTML='';
-for(var i=0;i<boxes.length;i++){
-var b=boxes[i],d=document.createElement('div');
-d.style.cssText='position:absolute;box-sizing:border-box;left:'+b.x.toFixed(1)+'px;top:'+b.y.toFixed(1)+'px;width:'+b.w.toFixed(1)+'px;height:'+b.h.toFixed(1)+'px;border:3px solid '+b.color+';box-shadow:0 0 6px '+b.color+',0 0 6px '+b.color+';background:transparent;';
-if(b.label){var lbl=document.createElement('div');lbl.textContent=b.label;
-lbl.style.cssText='position:absolute;top:-18px;left:0;color:'+b.color+';font:bold 14px monospace;text-shadow:0 0 3px #000,0 0 3px #000,0 0 3px #000;';
-d.appendChild(lbl);}
-ov.appendChild(d);}
-})(""" + json.dumps(boxes) + ")"
-        try:
-            cdp.eval_js(js)
-        except Exception:  # noqa: BLE001  -- overlay is cosmetic
-            pass
+        self.io.draw_overlay(boxes)
 
     def _demo_hide(self):
         if not self.demo:
             return
-        try:
-            cdp.eval_js("(function(){var o=document.getElementById('ac-demo-overlay');"
-                        "if(o)o.innerHTML='';})()")
-        except Exception:  # noqa: BLE001
-            pass
+        self.io.hide_overlay()
 
     def _demo_pair(self, r1, c1, r2, c2):
         """Outline the chosen pair: tile 1 cyan, tile 2 yellow (with order labels)."""
@@ -497,22 +456,14 @@ ov.appendChild(d);}
         (instant, deterministic -- bypasses the lossy headless-canvas click
         path); falls back to CDP clicks otherwise. Returns True if removed."""
         if self._ei_remove_ok():
-            # SWF board has a 1-cell -1 border: name myicon_x{X}y{Y}, X=col, Y=row.
-            # acRemovePair is deterministic, so a single attempt suffices: a fail
-            # means the pair isn't truly same-type, and the caller blacklists it /
-            # eventually reshuffles. Poll tilesLeft until it drops (accepted) or
-            # verify_wait elapses -- returns as soon as the removal lands instead
-            # of always waiting the full verify_wait.
+            # acRemovePair is deterministic: a fail means the pair isn't truly
+            # same-type, and the caller blacklists it / eventually reshuffles.
+            # io.remove_pair executes it + polls acStatus until the removal lands
+            # (verify_wait); a real removal drops tilesLeft below the pre-call tl0.
             tl0 = self._tiles_left()
             if tl0 < 2:
                 return True
-            _player_call("acRemovePair", c1 + 1, r1 + 1, c2 + 1, r2 + 1)
-            deadline = time.time() + self.verify_wait
-            while time.time() < deadline:
-                if self._tiles_left() < tl0:
-                    return True
-                time.sleep(0.03)
-            return False
+            return self.io.remove_pair(r1, c1, r2, c2) < tl0
         for _ in range(retries):                       # fallback: lossy CDP clicks
             tl0 = self._tiles_left()
             if tl0 < 2:
@@ -557,7 +508,7 @@ ov.appendChild(d);}
             return None
         self._recover_count += 1
         tl0 = self._tiles_left()
-        _player_call("acPlayOne")                 # createNewMap when deadlocked
+        self.io.reshuffle()                       # acReshuffle -> createNewMap (no builtin solver)
         time.sleep(1.5)                            # let the reshuffle render settle
         present = self._sync_present()
         if present is None:
@@ -823,15 +774,14 @@ ov.appendChild(d);}
     def advance(self):
         """Dismiss the level-complete / game-complete overlay and proceed.
 
-        Called only right after clear_board() emptied the board, so the only
-        non-no-op path inside the SWF's action dispatch is the result-overlay
-        handler (acHandleResult -> next level / restart). On an empty board the
-        solver branch (acPlayOne) is a no-op, so this never solves for us. We
-        stop the moment a fresh board appears. (Equivalent to clicking
-        'continue'; no board state is read.)"""
+        Called only right after clear_board() emptied the board. Uses acAdvance,
+        which dismisses the result overlay (acHandleResult -> next level /
+        restart) ONLY -- never acStep/acPlayOne, which can reach the builtin
+        pair-finder (vum.cunufi). Stops the moment a fresh board appears.
+        (Equivalent to clicking 'continue'; no board state is read.)"""
         if self.transition_mode == "ei":
             for _ in range(20):
-                _player_call("acStep")
+                self.io.advance()       # acAdvance: dismiss result overlay only
                 time.sleep(0.45)
                 img = self.snap()
                 g = vision.detect_grid(img)
@@ -932,26 +882,16 @@ ov.appendChild(d);}
 
     def _begin_run(self):
         if self.transition_mode == "ei":
-            _player_call("acSetEnabled", False)
-            _player_call("acReset")
+            self.io.set_enabled(False)
+            self.io.reset()
             time.sleep(3.0)
-            _player_call("acSetEnabled", False)
+            self.io.set_enabled(False)
 
     @staticmethod
     def _wait_player(timeout=40.0):
-        t = time.time()
-        while time.time() - t < timeout:
-            v = _ev("(function(){var e=document.getElementsByTagName('ruffle-embed')[0];"
-                    "return !!(e && typeof e.acStatus==='function');})()")
-            if v is True:
-                return True
-            time.sleep(0.4)
-        return False
-
-
-def _has_ei(method):
-    return _ev("(function(){var e=document.getElementsByTagName('ruffle-embed')[0];"
-               "return !!(e && typeof e.%s==='function');})()" % method) is True
+        """Poll until the SWF's EI bridge (acStatus) is callable. Convenience for
+        external launchers (solver/demo.sh); the bot itself uses self.io.wait_ready."""
+        return gameio.CDPGameIO().wait_ready(timeout)
 
 
 def main():
