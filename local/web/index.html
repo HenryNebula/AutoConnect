@@ -50,5 +50,10 @@
       setTimeout(function () { clearInterval(t); }, 15000);
     })();
   </script>
+
+  <!-- CV-solver backend client: WebSocket to the FastAPI server, drives the
+       Ruffle game (canvas capture, acRemovePair/acReshuffle/acAdvance exec,
+       bbox overlay). See local/web/app.js + solver/server.py. -->
+  <script src="app.js?v=1" defer></script>
 </body>
 </html>
