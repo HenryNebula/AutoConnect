@@ -46,6 +46,10 @@ DATA_DIR = os.environ.get(
 HARVEST_DIR = os.path.join(DATA_DIR, "harvest")
 DATASET_DIR = os.path.join(DATA_DIR, "dataset")
 MODELS_DIR = os.path.join(DATA_DIR, "models")
+# Reference-gallery of labelled tile crops consumed by the runtime NCC backbone
+# (gallery.GalleryClassifier). Like the model checkpoints, it is regenerable
+# from harvest data (see bot.ensure_gallery), so it lives under AC_DATA_DIR.
+GALLERY_PATH = os.path.join(DATA_DIR, "gallery_lvl1.npz")
 
 
 def ensure_dirs(*paths: str) -> None:
