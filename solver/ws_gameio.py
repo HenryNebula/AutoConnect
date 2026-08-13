@@ -152,26 +152,31 @@ class WSGameIO(gameio.GameIO):
         """Send ``msg`` to the browser and block on its reply.
 
         Adds the next monotonic id, registers a Future, enqueues, and waits.
-        Raises on browser error, timeout, or disconnect.
+        Raises on browser error, timeout, or disconnect. The check-then-add
+        against ``_closed`` happens under ``_pending_lock`` so a ``shutdown``
+        racing us from another (loop) thread can never leave a Future in
+        ``_pending`` that nobody will ever resolve (which would force the
+        worker to wait out the full per-call timeout).
         """
-        if self._closed:
-            raise RuntimeError("WSGameIO closed (browser disconnected)")
-
+        if timeout is None:
+            timeout = self._timeout
         mid = next(self._id_counter)
         msg = {**msg, "id": mid}
         fut: Future = Future()
         with self._pending_lock:
+            if self._closed:
+                raise RuntimeError("WSGameIO closed (browser disconnected)")
             self._pending[mid] = fut
         # Push to the outgoing queue; the loop-thread pump turns this into
         # ``await ws.send_text(json.dumps(msg))``.
         self._outgoing.put(msg)
 
         try:
-            return fut.result(timeout=timeout or self._timeout)
+            return fut.result(timeout=timeout)
         except _FutureTimeout:
             raise TimeoutError(
                 f"WSGameIO request {msg.get('type')!r} (id={mid}) timed out "
-                f"after {timeout or self._timeout:.0f}s with no browser reply"
+                f"after {timeout:.0f}s with no browser reply"
             )
         finally:
             with self._pending_lock:
@@ -201,9 +206,11 @@ class WSGameIO(gameio.GameIO):
 
     def shutdown(self) -> None:
         """Fail all pending calls and release the outgoing pump. Loop-thread
-        only. Idempotent."""
-        self._closed = True
+        only. Idempotent. ``_closed`` is set under ``_pending_lock`` so a
+        concurrently-running ``_request`` either sees ``_closed`` and aborts
+        or has already added its Future (which we then fail) -- never both."""
         with self._pending_lock:
+            self._closed = True
             futs = list(self._pending.values())
             self._pending.clear()
         for f in futs:
