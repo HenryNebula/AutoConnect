@@ -5,7 +5,16 @@
 set -uo pipefail
 
 DISPLAY_NUM=99
-export DISPLAY=":$DISPLAY_NUM"
+if [ "${AC_HEADED:-0}" = "1" ]; then
+  # Headed: land the --app window on the user's real graphical session so it can
+  # be watched / screen-recorded. CDP capture+click are display-agnostic, so the
+  # only change vs the Xvfb path is which X display chrome lands on (no Xvfb).
+  export DISPLAY="${DISPLAY:-:1}"
+  AC_HEADED_ACTIVE=1
+else
+  export DISPLAY=":$DISPLAY_NUM"
+  AC_HEADED_ACTIVE=0
+fi
 JOBTMP="${CLAUDE_JOB_DIR:-/tmp}/tmp"
 PORT_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/local/.serve_port"
 PORT="${AC_PORT:-$(cat "$PORT_FILE" 2>/dev/null || echo 8765)}"
@@ -44,6 +53,7 @@ start_chrome() {
     --disable-gpu --disable-software-rasterizer --no-sandbox \
     --no-first-run --no-default-browser-check --disable-features=Translate \
     --window-position=0,0 --window-size=${GEOM_W},${GEOM_H} \
+    --force-device-scale-factor=1 \
     --remote-debugging-port=9222 --remote-allow-origins=* \
     --app="http://127.0.0.1:${PORT}/" \
     > "$JOBTMP/game_chrome.log" 2>&1 < /dev/null &
@@ -52,7 +62,9 @@ start_chrome() {
 
 case "${1:-status}" in
   start)
-    start_xvfb || exit 1
+    if [ "$AC_HEADED_ACTIVE" != "1" ]; then
+      start_xvfb || exit 1
+    fi
     start_chrome
     ;;
   stop)

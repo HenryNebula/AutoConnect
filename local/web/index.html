@@ -11,7 +11,11 @@
       autoplay: "on",
       unmuteOverlay: "visible",
       backgroundColor: "#000000",
-      publicPath: "ruffle/"
+      publicPath: "ruffle/",
+      // Force the 2D-canvas renderer. The default wgpu-webgl renderer paints to a
+      // WebGL canvas whose buffer isn't preserved, so canvas.toDataURL (how the
+      // CV backend reads the board) reads back BLANK. The 2D canvas is readable.
+      preferredRenderer: "canvas"
     };
   </script>
   <script src="ruffle/ruffle.js"></script>
@@ -23,7 +27,7 @@
 </head>
 <body>
   <!-- Ruffle's polyfill auto-detects this <embed> SWF and replaces it with a player -->
-  <embed id="game" name="game" src="game_inner.swf?v=3" width="100%" height="100%" allowscriptaccess="always" />
+  <embed id="game" name="game" src="game_inner.swf?v=4" width="100%" height="100%" allowscriptaccess="always" />
 
   <!-- Hide Ruffle's "click to unmute" speaker ICON only.
        The overlay's .background is a 70%-black veil that crushes the whole board
@@ -50,5 +54,10 @@
       setTimeout(function () { clearInterval(t); }, 15000);
     })();
   </script>
+
+  <!-- CV-solver backend client: WebSocket to the FastAPI server, drives the
+       Ruffle game (canvas capture, acRemovePair/acReshuffle/acAdvance exec,
+       bbox overlay). See local/web/app.js + solver/server.py. -->
+  <script src="app.js?v=1" defer></script>
 </body>
 </html>

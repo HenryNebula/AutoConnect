@@ -17,7 +17,6 @@ Level/game transitions are driven as control handles (see ``advance``): the
 patched SWF's ExternalInterface callbacks (acSetEnabled/acReset/acStep) are used.
 """
 from __future__ import annotations
-import json
 import os
 import sys
 import time
@@ -28,6 +27,7 @@ import cv2
 import cdp
 import vision
 import conn
+import gameio
 try:
     import conn_fast as _cf   # compiled rollout/exact lookahead (solver/cpp/build.sh)
 except Exception:             # noqa: BLE001
@@ -38,26 +38,13 @@ CANON = galmod.CANON
 DEFAULT_BG = np.array([53.0, 44.0, 26.0], dtype=np.float32)
 
 
-def _ev(expr):
-    r = cdp._send("Runtime.evaluate", {"expression": expr, "returnByValue": True})
-    return r.get("result", {}).get("value")
-
-
-def _player_call(method, *args):
-    a = ",".join(json.dumps(x) for x in args)
-    expr = ("(function(){var e=document.getElementsByTagName('ruffle-embed')[0];"
-            "if(!e||typeof e.%s!=='function')return undefined;"
-            "try{return e.%s(%s);}catch(x){return 'ERR:'+x;}})()" % (method, method, a))
-    return _ev(expr)
-
-
 def canon(crop):
     return cv2.resize(crop, (CANON, CANON), interpolation=cv2.INTER_AREA)
 
 
 class Bot:
     def __init__(self, gallery_path=None, verbose=True, transition_mode="ei",
-                 model_path=None):
+                 model_path=None, io=None):
         self.verbose = verbose
         self.grid = None
         self.bg = DEFAULT_BG.copy()
@@ -65,12 +52,19 @@ class Bot:
         self.known_diff = set()
         self.click_settle = 0.20
         self.verify_wait = 0.40
+        self.gravity_settle = 0.6   # wait for L2+ per-level gravity (dongzuo) to
+                                    # settle after a removal before re-snapping
+        # Game I/O backend: CDPGameIO for the local-Chrome rig, WSGameIO for the
+        # LAN browser backend. The brain calls self.io.* and never imports cdp
+        # for game I/O (only the click-cell fallback still uses cdp directly).
+        # See solver/gameio.py.
+        self.io = io if io is not None else gameio.CDPGameIO(verify_wait=self.verify_wait)
         self.transition_mode = transition_mode   # "ei" (dev) or "click" (vanilla)
         self.empty_template = None     # learned empty-slot crop (CANON-sized)
         self.empty_thr = 0.55          # NCC >= this => cell is an empty slot
         self.std_thr = 60.0            # icon-std floor (learned at level start)
         self._recover_count = 0        # deadlock-reshuffle attempts this level
-        self.use_remove_pair = None    # cached _has_ei("acRemovePair"); None=unprobed
+        self.use_remove_pair = None    # cached io.has_ei("acRemovePair"); None=unprobed
         # Learned same-type tile classifier (issue #3): the trained PairNet is a
         # drop-in scoring function for gallery.color_ncc. If no model is present
         # (or torch is missing) the bot falls back to colour-NCC, unchanged.
@@ -91,6 +85,16 @@ class Bot:
         self._cf_counter = 0       # per-call seed source for reproducible rollouts
         self._sim = None            # cached all-pairs tile-sim matrix (NN only)
         self._sim_tiles = None      # id(self.cur_tiles) the cache belongs to
+        # Demo / visualization (--demo): paint a DOM bbox overlay on each chosen
+        # pair in the live browser window, pause, THEN clear (acRemovePair is
+        # instant, so the pause must precede it for the boxes to be visible).
+        # Cosmetic only -- every overlay call is try/except-guarded so it can
+        # never break a run. See _demo_show / _demo_pair / _demo_hide.
+        self.demo = False          # paint the per-pair bbox overlay before clears
+        self.demo_pause = 0.7      # seconds each pair's boxes stay on screen
+        self.demo_flash = True     # flash a box over every grid cell at level start
+        self.save_frames = False   # also write annotated PNGs to $tmp/demo/
+        self._frame_idx = 0
 
     @staticmethod
     def _default_siamese_model():
@@ -173,9 +177,7 @@ class Bot:
 
     # ---- low level --------------------------------------------------------
     def snap(self):
-        p = os.path.join(os.environ.get("CLAUDE_JOB_DIR", "/tmp"), "tmp", "_bot.png")
-        cdp.capture(p)
-        return vision.load_img(p)
+        return self.io.capture()
 
     def click_cell(self, r, c):
         x, y = float(self.grid["xs"][c]), float(self.grid["ys"][r])
@@ -367,43 +369,103 @@ class Bot:
         per-cell pixel-diff, which is unreliable on the dim (~50) veiled board:
         the selection-light toggle and low-contrast removals both produce
         diff-40-ish false positives/negatives that desync the present mask."""
-        s = _player_call("acStatus")
-        if isinstance(s, str):
-            try:
-                return int(json.loads(s).get("tilesLeft", 99))
-            except Exception:  # noqa: BLE001
-                return 99
-        return 99
+        return int(self.io.status().get("tilesLeft", 99))
 
     def _ei_remove_ok(self):
         """True if the patched SWF exposes the acRemovePair EI handle (probed once)."""
         if self.use_remove_pair is None:
-            self.use_remove_pair = bool(_has_ei("acRemovePair"))
+            self.use_remove_pair = self.io.has_ei("acRemovePair")
         return self.use_remove_pair
 
+    # ---- demo / visualization (--demo) -----------------------------------
+    # Paint a DOM bbox overlay on the chosen pair in the live browser window so
+    # the solver's picks are visible (and screen-recordable) before each clear.
+    # Coordinates reuse the same grid xs/ys/ts the click path uses, so boxes sit
+    # exactly on tiles; the overlay is position:fixed at z-index max so it paints
+    # above Ruffle's shadow-DOM dimming veil (bright on the dim recorded board).
+    # Every call is try/except-guarded -- the overlay is cosmetic and must never
+    # break a run.
+    def _demo_show(self, boxes):
+        """Render the given boxes [{x,y,w,h,color,label?}] via the I/O backend
+        (a DOM overlay on document.body for CDP; an overlay canvas in-browser)."""
+        if not self.demo:
+            return
+        self.io.draw_overlay(boxes)
+
+    def _demo_hide(self):
+        if not self.demo:
+            return
+        self.io.hide_overlay()
+
+    def _demo_pair(self, r1, c1, r2, c2):
+        """Outline the chosen pair: tile 1 cyan, tile 2 yellow (with order labels)."""
+        if not self.demo:
+            return
+        g = self.grid
+        ts = float(g["ts"])
+
+        def box(r, c, color, label):
+            return {"x": float(g["xs"][c]) - ts / 2, "y": float(g["ys"][r]) - ts / 2,
+                    "w": ts, "h": ts, "color": color, "label": label}
+        self._demo_show([box(r1, c1, "#00FFFF", "1"), box(r2, c2, "#FFFF00", "2")])
+        if self.save_frames:
+            self._save_demo_frame(r1, c1, r2, c2)
+
+    def _save_demo_frame(self, r1, c1, r2, c2):
+        """Snapshot the (bright, unveiled) bot view, draw the pair boxes, save a
+        PNG. For demo frame sequences / recording material; off unless
+        --save-frames. These PNGs are the BRIGHT screenshot (the dimming veil
+        doesn't composite into Page.captureScreenshot), distinct from the dim
+        recorded window."""
+        from PIL import Image, ImageDraw
+        pil = Image.fromarray(self.snap())
+        d = ImageDraw.Draw(pil)
+        g = self.grid
+        ts = float(g["ts"])
+
+        def rect(r, c, color):
+            x = float(g["xs"][c]) - ts / 2
+            y = float(g["ys"][r]) - ts / 2
+            d.rectangle([x, y, x + ts, y + ts], outline=color, width=4)
+        rect(r1, c1, (0, 255, 255))
+        rect(r2, c2, (255, 255, 0))
+        out_dir = os.path.join(os.environ.get("CLAUDE_JOB_DIR", "/tmp"), "tmp", "demo")
+        os.makedirs(out_dir, exist_ok=True)
+        self._frame_idx += 1
+        pil.save(os.path.join(out_dir, f"{self._frame_idx:04d}.png"))
+
     def _click_pair_removes(self, r1, c1, r2, c2, retries=3):
+        """Remove a pair and confirm by the game's tile count dropping.
+
+        In --demo mode, paint the bbox overlay on the chosen pair and pause
+        BEFORE the (instant) acRemovePair dispatch so the boxes are visible
+        while the tiles are still on screen; remove the overlay afterwards
+        (try/finally so it never leaks across returns / level transitions).
+        """
+        if self.demo:
+            self._demo_pair(r1, c1, r2, c2)
+            time.sleep(self.demo_pause)
+        try:
+            return self._click_pair_removes_inner(r1, c1, r2, c2, retries)
+        finally:
+            if self.demo:
+                self._demo_hide()
+
+    def _click_pair_removes_inner(self, r1, c1, r2, c2, retries=3):
         """Remove a pair and confirm by the game's tile count dropping.
 
         Uses the SWF's ``acRemovePair`` ExternalInterface handle when available
         (instant, deterministic -- bypasses the lossy headless-canvas click
         path); falls back to CDP clicks otherwise. Returns True if removed."""
         if self._ei_remove_ok():
-            # SWF board has a 1-cell -1 border: name myicon_x{X}y{Y}, X=col, Y=row.
-            # acRemovePair is deterministic, so a single attempt suffices: a fail
-            # means the pair isn't truly same-type, and the caller blacklists it /
-            # eventually reshuffles. Poll tilesLeft until it drops (accepted) or
-            # verify_wait elapses -- returns as soon as the removal lands instead
-            # of always waiting the full verify_wait.
+            # acRemovePair is deterministic: a fail means the pair isn't truly
+            # same-type, and the caller blacklists it / eventually reshuffles.
+            # io.remove_pair executes it + polls acStatus until the removal lands
+            # (verify_wait); a real removal drops tilesLeft below the pre-call tl0.
             tl0 = self._tiles_left()
             if tl0 < 2:
                 return True
-            _player_call("acRemovePair", c1 + 1, r1 + 1, c2 + 1, r2 + 1)
-            deadline = time.time() + self.verify_wait
-            while time.time() < deadline:
-                if self._tiles_left() < tl0:
-                    return True
-                time.sleep(0.03)
-            return False
+            return self.io.remove_pair(r1, c1, r2, c2) < tl0
         for _ in range(retries):                       # fallback: lossy CDP clicks
             tl0 = self._tiles_left()
             if tl0 < 2:
@@ -448,7 +510,7 @@ class Bot:
             return None
         self._recover_count += 1
         tl0 = self._tiles_left()
-        _player_call("acPlayOne")                 # createNewMap when deadlocked
+        self.io.reshuffle()                       # acReshuffle -> createNewMap (no builtin solver)
         time.sleep(1.5)                            # let the reshuffle render settle
         present = self._sync_present()
         if present is None:
@@ -459,25 +521,37 @@ class Bot:
         return present
 
     def clear_board(self, max_moves=140):
-        """Clear the current board, fast.
+        """Clear the current board.
 
-        Grid + tiles are snapshotted ONCE (tiles don't drift mid-level -- the
-        level mechanics are layout-only); the sim matrix is built once and the
-        per-move classifier just masks removed cells via ``present``. Each
-        removal is confirmed by the GAME's tilesLeft dropping; a non-drop means
-        a mis-classification (the pair is blacklisted). On a deadlock the SWF
-        reshuffles (acPlayOne -> createNewMap) and the board is re-snapshotted.
+        Re-perceives the board EVERY move (re-snapshot + re-extract tiles +
+        rebuild the sim matrix + re-derive present). L2+ levels apply per-level
+        gravity after every removal (``dongzuo``: L2 = createBottomMap, tiles
+        fall; L3+ = left/up/right/diagonal variants), so a level-start snapshot
+        would desync and cause false-positive pair picks. (L1 has no gravity, but
+        re-perceiving is harmless there.) Each removal is confirmed by tilesLeft
+        dropping; on a deadlock the SWF reshuffles (acReshuffle -> createNewMap).
         """
         if not self.establish_grid():
             return False, 0
         img = self.snap()
         self.learn_std_threshold(img)
-        # Snapshot tiles ONCE for the level -- tiles don't drift (level mechanics
-        # are layout-only), so the sim matrix + classifier reuse this, masking
-        # removed cells via `present` instead of re-snapping every move.
+        # Initial perception -- used by the warmup for the first, pre-gravity
+        # move; the main loop re-perceives every move after that.
         self.cur_tiles = vision.extract_tiles(img, self.grid)
         self._recover_count = 0
         present = np.ones((self.grid["rows"], self.grid["cols"]), dtype=bool)
+
+        if self.demo and self.demo_flash:
+            # Flash a faint box over every detected grid cell so a viewer sees
+            # the full lattice the solver perceives, before move-by-move picks.
+            g = self.grid
+            ts = float(g["ts"])
+            cells = [{"x": float(g["xs"][c]) - ts / 2, "y": float(g["ys"][r]) - ts / 2,
+                      "w": ts, "h": ts, "color": "rgba(0,255,255,0.35)"}
+                     for r in range(g["rows"]) for c in range(g["cols"])]
+            self._demo_show(cells)
+            time.sleep(1.5)
+            self._demo_hide()
 
         # Warm the click path: click top picks (with retry) until tilesLeft
         # first drops, tracking the removal so the present mask stays exact.
@@ -497,28 +571,35 @@ class Bot:
         fails = 0
         cleared = False
         while moves < max_moves:
-            if not present.any() or self._tiles_left() < 2:
+            tl = self._tiles_left()
+            if tl < 2:
+                cleared = True
+                break
+            # Re-perceive EVERY move. L2+ levels apply per-level gravity after
+            # each removal (dongzuo(): L2=createBottomMap tiles fall, L3+ left/
+            # up/right/diagonal variants), so a level-start snapshot desyncs and
+            # causes false-positive pair picks. Re-snapshot + re-extract + rebuild
+            # the sim matrix + re-derive present from the live board.
+            img = self.snap()
+            self.cur_tiles = vision.extract_tiles(img, self.grid)
+            self._sim = None                       # force _ensure_sim rebuild
+            present = self.present_by_count(img, tl)
+            if not present.any():
                 cleared = True
                 break
             mv = self._pick_move(present)
-            progressed = False
-            if mv is not None:
-                (r1, c1), (r2, c2) = mv
-                if self._click_pair_removes(r1, c1, r2, c2):
-                    moves += 1
-                    fails = 0
-                    progressed = True
-                    present[r1, c1] = False
-                    present[r2, c2] = False
-                    if moves % 12 == 0 and self.verbose:
-                        print(f"[bot] {moves} moves, {int(present.sum())} left", flush=True)
-                else:
-                    # acRemovePair is deterministic: a fail means the pair isn't
-                    # truly same-type (NN false positive). Blacklist it; if this
-                    # keeps happening the board is effectively deadlocked for us.
-                    self.known_diff.add(frozenset(((r1, c1), (r2, c2))))
-            if progressed:
+            if mv is not None and self._click_pair_removes(
+                    mv[0][0], mv[0][1], mv[1][0], mv[1][1]):
+                moves += 1
+                fails = 0
+                if moves % 12 == 0 and self.verbose:
+                    print(f"[bot] {moves} moves, {self._tiles_left()} left", flush=True)
+                time.sleep(self.gravity_settle)     # let the gravity anim settle
                 continue
+            # No progress: a deterministic acRemovePair fail means the two tiles
+            # at those cells aren't truly same-type -- blacklist and re-pick.
+            if mv is not None:
+                self.known_diff.add(frozenset((mv[0], mv[1])))
             fails += 1
             if fails and fails % 20 == 0:
                 self.known_diff.clear()
@@ -527,16 +608,15 @@ class Bot:
                           f"tilesLeft={self._tiles_left()}", flush=True)
             if fails < 15:
                 continue
-            # Stuck -- no progress for ~15 attempts (no move found, or every
-            # candidate is a false positive). Re-derive present; reshuffle if
-            # genuinely deadlocked (acPlayOne -> createNewMap), then resume.
+            # Stuck for ~15 attempts -> re-derive present; reshuffle
+            # (acReshuffle -> createNewMap) if genuinely deadlocked, then resume.
             present = self._try_reshuffle(present)
             if present is None:
                 break
             self.known_diff.clear()
             fails = 0
-            if not present.any() or self._tiles_left() < 2:
-                cleared = self._tiles_left() < 2
+            if self._tiles_left() < 2:
+                cleared = True
                 break
         if not cleared:
             cleared = self._tiles_left() < 2
@@ -702,15 +782,14 @@ class Bot:
     def advance(self):
         """Dismiss the level-complete / game-complete overlay and proceed.
 
-        Called only right after clear_board() emptied the board, so the only
-        non-no-op path inside the SWF's action dispatch is the result-overlay
-        handler (acHandleResult -> next level / restart). On an empty board the
-        solver branch (acPlayOne) is a no-op, so this never solves for us. We
-        stop the moment a fresh board appears. (Equivalent to clicking
-        'continue'; no board state is read.)"""
+        Called only right after clear_board() emptied the board. Uses acAdvance,
+        which dismisses the result overlay (acHandleResult -> next level /
+        restart) ONLY -- never acStep/acPlayOne, which can reach the builtin
+        pair-finder (vum.cunufi). Stops the moment a fresh board appears.
+        (Equivalent to clicking 'continue'; no board state is read.)"""
         if self.transition_mode == "ei":
             for _ in range(20):
-                _player_call("acStep")
+                self.io.advance()       # acAdvance: dismiss result overlay only
                 time.sleep(0.45)
                 img = self.snap()
                 g = vision.detect_grid(img)
@@ -811,26 +890,16 @@ class Bot:
 
     def _begin_run(self):
         if self.transition_mode == "ei":
-            _player_call("acSetEnabled", False)
-            _player_call("acReset")
+            self.io.set_enabled(False)
+            self.io.reset()
             time.sleep(3.0)
-            _player_call("acSetEnabled", False)
+            self.io.set_enabled(False)
 
     @staticmethod
     def _wait_player(timeout=40.0):
-        t = time.time()
-        while time.time() - t < timeout:
-            v = _ev("(function(){var e=document.getElementsByTagName('ruffle-embed')[0];"
-                    "return !!(e && typeof e.acStatus==='function');})()")
-            if v is True:
-                return True
-            time.sleep(0.4)
-        return False
-
-
-def _has_ei(method):
-    return _ev("(function(){var e=document.getElementsByTagName('ruffle-embed')[0];"
-               "return !!(e && typeof e.%s==='function');})()" % method) is True
+        """Poll until the SWF's EI bridge (acStatus) is callable. Convenience for
+        external launchers (solver/demo.sh); the bot itself uses self.io.wait_ready."""
+        return gameio.CDPGameIO().wait_ready(timeout)
 
 
 def main():
@@ -848,6 +917,15 @@ def main():
                     help="enable the C++ rollout lookahead (conn_fast)")
     ap.add_argument("--ncc", action="store_true",
                     help="use colour-NCC as the tile backbone (skip the NN model)")
+    ap.add_argument("--demo", action="store_true",
+                    help="paint a bbox overlay on each chosen pair in the browser "
+                         "window before clearing (for live viewing / recording)")
+    ap.add_argument("--pause", type=float, default=0.7,
+                    help="seconds each pair's boxes stay on screen (--demo)")
+    ap.add_argument("--save-frames", action="store_true",
+                    help="also save annotated PNGs of each pick to $tmp/demo/")
+    ap.add_argument("--no-flash", action="store_true",
+                    help="skip the level-start full-grid flash (--demo)")
     args = ap.parse_args()
     bot = Bot(args.gallery, verbose=not args.q, transition_mode=args.transition,
               model_path=args.model)
@@ -860,6 +938,13 @@ def main():
         bot.nn = None
         bot.cand_thr = 0.7
         print("[bot] backbone = colour-NCC (cand_thr=0.7)")
+    if args.demo:
+        bot.demo = True
+        bot.demo_pause = args.pause
+        bot.demo_flash = not args.no_flash
+        bot.save_frames = args.save_frames
+        print(f"[bot] demo mode on (pause={args.pause}s, flash={bot.demo_flash}, "
+              f"save_frames={bot.save_frames})")
     bot.play_game(args.runs, args.max_level)
 
 
