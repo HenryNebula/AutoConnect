@@ -1,92 +1,131 @@
 # AutoConnect — Linux solver for 宠物连连看 (Pokémon Lianliankan)
 
 A bot that **completely solves the Flash tile-matching game on Linux**, clearing
-all 13 levels repeatedly with zero failures (~146 s per full clear).
+all 13 levels repeatedly (~50 s per level with the CV backbone).
 
-## Approach: patch the SWF, let the game solve itself
+## Approach: patch the SWF for control, solve by computer vision
 
-The earlier plan — computer vision + simulated mouse clicks — does not work
-here: Ruffle ignores the stage-level `MOUSE_DOWN` handler that tiles use, so no
-amount of `xdotool` / CDP clicking can select a tile. Instead the SWF itself is
-patched so the game plays itself, and a Python harness observes the exact board
-state over the Chrome DevTools Protocol.
+The game runs in Chrome via Ruffle (WASM). Ruffle ignores the stage-level
+`MOUSE_DOWN` handler the tiles use, so `xdotool` / CDP mouse clicks cannot
+select a tile. The workaround is a patched SWF that exposes
+**ExternalInterface** handles, so a Python bot reads exact board state *and*
+executes the pairs **it** chooses — without ever consulting the game's own
+pair-finder.
 
-Two facts make this both possible and provably correct:
-
-1. **The game already contains a perfect solver.** It has a pair-finder
-   (`vum.cunufi()`, the hint engine) that returns any connectable pair, and a
-   move handler (`byqij()`) that removes a pair, scores, and advances the level
-   when the board empties. The bot reuses both, so every move it makes is a move
-   the game itself considers legal.
-2. **ExternalInterface works in Ruffle.** Callbacks registered with
-   `ExternalInterface.addCallback` are callable from JS as
-   `document.getElementById('game').<method>(...)`, reachable through CDP
-   `Runtime.evaluate`.
-
-### The patch (`solver/patch/Mafokem.as`)
-
-The inner SWF's identifiers are obfuscated into a Brahmic Unicode range that
-crashes FFdec's AS3 *text* compiler, so the patch is built on an ASCII-renamed
-base (`renameInvalidIdentifiers`). The patched main timeline:
+The patched main timeline (`solver/patch/Mafokem.as`):
 
 - **`frame1`**: skips the title overlay → starts level 1 immediately on load.
-- **`acInstallSolver` / `acTick`**: a 200 ms timer that each tick asks the game's
-  pair-finder for a connectable pair, executes it through the game's move
-  handler, and auto-advances / restarts across level-complete and game-complete
-  screens.
-- **ExternalInterface hooks**: `acStatus` (JSON: level, score, tilesLeft, scene,
-  reason, clears, fails, timeLeft, shuffles, …), plus `acReset`, `acSetEnabled`,
-  `acGetClears`, `acStep`, `acPlayOne`.
-- **Free reshuffles in `createNewMap`**: a greedy pair-picker inevitably hits
-  deadlocks; in the unpatched game each deadlock costs a "life" and life-out
-  (`生命耗尽`) resets the whole run, blocking any full clear. Reshuffling is the
-  correct response to a deadlock, so the patch reshuffles freely and never fails
-  out. (Time is never threatened — the bot clears a level in ~10 s vs the
-  90–250 s limits.) Boards are still cleared for real by finding genuine ≤2-turn
-  connections; only the arcade reshuffle-life limit is removed.
+- **ExternalInterface hooks** (callable from JS as
+  `document.getElementById('game').<method>(...)` over CDP `Runtime.evaluate`):
+  - `acStatus` — JSON board state (level, score, `tilesLeft`, scene, reason,
+    clears, fails, timeLeft, …). Read every move; `tilesLeft` is the bot's
+    acceptance signal that a removal landed.
+  - `acRemovePair` — **the runtime actuator**: removes a specific pair the bot
+    chose. This is an *airtight, no-`cunufi`* entry point — it never invokes the
+    game's built-in pair-finder, so every cleared pair is one the CV brain
+    selected.
+  - `acReshuffle` / `acAdvance` — reshuffle a deadlocked board / dismiss a
+    level-complete overlay, again without running the builtin solver.
+  - `acReset`, `acGetClears`, `acStep`, `acPlayOne` — diagnostics / legacy drive.
+- **Disabled autonomous solver.** The patch also contains a self-solver
+  (`acInstallSolver` / `acTick`, a 200 ms timer driving the game's own
+  pair-finder `vum.cunufi()`). It is **disabled by design** (`acEnabled = false`
+  at install): the pairing *decision* is the bot's own ≤2-turn connectivity
+  search, not the game's. `solver/driver.py --wins` merely watches that disabled
+  self-solver — it is a low-level CDP/status harness, **not** how the game is
+  cleared.
+- **Free reshuffles in `createNewMap`**: a greedy pair-picker deadlocks; in the
+  unpatched game each deadlock costs a "life" and life-out (`生命耗尽`) resets the
+  run. The patch reshuffles freely (the bot clears a level well inside the
+  90–250 s limits, so time is never threatened). Boards are still cleared by
+  genuine ≤2-turn connections; only the arcade reshuffle-life limit is removed.
+
+The CV brain (`solver/bot.py`): detects the tile grid once per level, classifies
+tiles (a trained PairNet siamese net, or colour-NCC against a reference gallery),
+finds legal ≤2-turn pairs with its own connectivity solver (plus an optional C++
+Monte-Carlo rollout lookahead to dodge deadlocks), and executes each via
+`acRemovePair`, confirming every removal against `tilesLeft`.
 
 ### Rebuild the patched SWF
 
 ```bash
 cd solver/patch
 ./get_ffdec.sh          # one-time: download FFdec CLI (needs java 11+)
-./build_patch.sh        # -> solver/patch/game_inner.swf
+./patch_swf.sh          # -> solver/patch/game_inner.swf  (the ONLY working path)
 ```
+
+> `build_patch.sh` is the broken from-scratch rebuild, kept for reference only.
+> Because FFdec's `-renameInvalidIdentifiers randomWord` is non-deterministic, a
+> fresh rename never matches the identifiers hardcoded in `Mafokem.as`, and a
+> from-scratch `-importScript` silently yields a broken SWF. `patch_swf.sh`
+> re-imports `Mafokem.as` into the **existing** built SWF (which carries the
+> matching rename) instead. After any patch, bump the `?v=` cache-bust on
+> `game_inner.swf` in `local/web/index.html` — Chrome caches the SWF.
+
+## Runtime artifacts (under `$AC_DATA_DIR`, regenerable, not committed)
+
+`AC_DATA_DIR` defaults to `/media/ext4-data/autoconnect-data`.
+
+| artifact | what | how it's produced |
+| --- | --- | --- |
+| `gallery_lvl1.npz` | reference tile crops for the NCC backbone | `bot.ensure_gallery` **auto-(re)builds** it from `harvest/` at startup |
+| `models/pairnet_*.pt` | trained PairNet tile-pair classifier | the supervised pipeline — see [`SUPERVISED.md`](SUPERVISED.md) |
+| `solver/conn_fast.*.so` | C++ rollout lookahead | `cd solver/cpp && ./build.sh` (needed for `--rollout`) |
+
+The bot falls back to colour-NCC if the NN model or `torch` is absent, and runs
+without `--rollout` (the lookahead only helps it avoid deadlocks).
 
 ## Running
 
-The game runs in Chrome (Ruffle, WASM) on a virtual X display. The harness
-talks to it over CDP (port 9222).
+The game runs in Chrome (Ruffle) on a virtual X display; the bot talks to it
+over CDP (port 9222).
 
 ```bash
-# 1. serve the patched SWF + Ruffle under local/web/ (see local/play_game.sh),
-#    and launch the headless Chrome app window on Xvfb :99:
+uv sync
+
+# 1. serve the patched SWF + Ruffle under local/web/, and launch the headless
+#    Chrome app window on Xvfb :99:
 bash solver/session.sh start
 
-# 2. watch / drive:
-python solver/driver.py --reload --status     # one snapshot
-python solver/driver.py --wins 3              # watch until 3 full clears
-python solver/driver.py --drive --wins 3      # step from Python instead
+# 2. run the CV bot (clears L1..L13 once; colour-NCC backbone + C++ lookahead).
+#    Use the project venv python (direnv sets UV_PROJECT_ENVIRONMENT; see .envrc):
+$UV_PROJECT_ENVIRONMENT/bin/python solver/bot.py --runs 1 --max-level 13 --ncc --rollout
+#    NN backbone instead of NCC:
+#      $UV_PROJECT_ENVIRONMENT/bin/python solver/bot.py --runs 1 --max-level 13 --rollout
+
+# 3. (optional) one-shot board snapshot / low-level CDP harness:
+$UV_PROJECT_ENVIRONMENT/bin/python solver/driver.py --reload --status
 ```
 
+For a **headed**, watchable run with per-pair bbox overlays drawn before each
+clear, use `bash solver/demo.sh [levels]` (it does steps 1–2 with `--demo` on the
+real display).
+
 Dependencies (uv): `numpy`, `pillow`, `scikit-image`, `scikit-learn`, `scipy`,
-`opencv-python-headless`, plus `websocket-client` for CDP.
+`opencv-python-headless`, `websocket-client`, `torch`.
 
 ## Files
 
 | path | role |
 | --- | --- |
-| `solver/patch/Mafokem.as` | patched main timeline (the self-solver + EI hooks) |
-| `solver/patch/game_inner.swf` | built, runnable patched SWF |
-| `solver/patch/build_patch.sh` | regenerates the patched SWF from `static/game.swf` |
-| `solver/driver.py` | CDP harness: observe / drive / confirm clears |
+| `solver/bot.py` | **runtime CV bot**: perceive → solve → act via `acRemovePair` |
+| `solver/patch/Mafokem.as` | patched main timeline (EI hooks; disabled self-solver) |
+| `solver/patch/patch_swf.sh` | incremental SWF patcher (the working build path) |
+| `solver/patch/game_inner.swf` | built, runnable patched SWF (served from `local/web/`) |
+| `solver/gallery.py` | reference-gallery NCC tile classifier (`build_gallery`) |
+| `solver/gallery_nn.py` | trained PairNet classifier (runtime hook) |
+| `solver/dsio.py` | `AC_DATA_DIR` paths (gallery, harvest, dataset, models) |
+| `solver/conn.py`, `solver/cpp/conn_fast.cpp` | ≤2-turn connectivity + C++ rollout lookahead |
+| `solver/perception.py`, `solver/vision.py` | board / tile perception |
+| `solver/gameio.py` | GameIO backend (`CDPGameIO` local; `WSGameIO` LAN) |
+| `solver/server.py` | optional FastAPI WebSocket backend (LAN browser frontend) |
 | `solver/cdp.py` | minimal Chrome DevTools Protocol client |
 | `solver/session.sh` | launches Xvfb :99 + headless Chrome app window |
+| `solver/demo.sh` | one-shot headed demo launcher (bbox overlays) |
+| `solver/driver.py` | low-level CDP / status harness (not the solver) |
 | `solver/solve.py` | standalone ≤2-turn connectivity solver (reference) |
-| `solver/actuator.py` | capture / click layer (legacy, pre-patch) |
-| `solver/perception*.py`, `solver/*grid*.py` | earlier CV-perception experiments (superseded by the SWF patch; kept for reference) |
 
 ## Result
 
-Validated **3 consecutive full 13-level clears with zero fails** (clears at
-t = 149 s / 297 s / 446 s from a fresh `acReset`).
+The CV bot clears all 13 levels repeatedly (~50 s per level with the NCC
+backbone; validated on consecutive runs).

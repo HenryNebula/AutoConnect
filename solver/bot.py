@@ -33,6 +33,7 @@ try:
 except Exception:             # noqa: BLE001
     _cf = None
 import gallery as galmod
+import dsio
 
 CANON = galmod.CANON
 DEFAULT_BG = np.array([53.0, 44.0, 26.0], dtype=np.float32)
@@ -40,6 +41,51 @@ DEFAULT_BG = np.array([53.0, 44.0, 26.0], dtype=np.float32)
 
 def canon(crop):
     return cv2.resize(crop, (CANON, CANON), interpolation=cv2.INTER_AREA)
+
+
+def ensure_gallery(path: str, pairs_per_level: int = 25) -> str:
+    """Ensure the runtime NCC reference gallery exists; (re)build it on demand.
+
+    The gallery is a bundle of labelled tile crops that the colour-NCC backbone
+    (``gallery.GalleryClassifier``) matches runtime tiles against. It is
+    regenerable from oracle harvest data, so — like the PairNet checkpoints — it
+    is deliberately not committed; this rebuilds it from ``dsio.HARVEST_DIR`` if
+    it is missing, so a fresh checkout can run the bot with no manual build step.
+    Novel tile types absent from the gallery are still grouped at runtime by
+    colour-NCC, so a modest sample per level is enough (the cap also bounds
+    ``build_gallery``'s O(H^2) clustering cost).
+    """
+    import glob
+    import tempfile
+    if not path or os.path.exists(path):
+        return path
+    boards = sorted(glob.glob(os.path.join(dsio.HARVEST_DIR, "board_*.npz")))
+    if not boards:
+        raise FileNotFoundError(
+            f"gallery not found at {path} and no harvested pairs under "
+            f"{dsio.HARVEST_DIR}; run `python solver/harvest.py` first "
+            "(see solver/SUPERVISED.md).")
+    bylv: dict[int, list] = {}
+    for b in boards:
+        d = np.load(b, allow_pickle=True)
+        bylv.setdefault(int(d["level"]), []).append(d["pairs"])
+    sel = []
+    for lv, bs in sorted(bylv.items()):
+        flat = np.concatenate(bs, axis=0)
+        k = min(pairs_per_level, len(flat))
+        idx = np.linspace(0, len(flat) - 1, k).astype(int)
+        sel.append(flat[idx])
+    sub = np.concatenate(sel, axis=0)
+    print(f"[bot] building NCC gallery ({len(sub)} pairs, {len(bylv)} levels) -> {path}")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = tempfile.mktemp(suffix=".npz")
+    try:
+        np.savez_compressed(tmp, pairs=sub)
+        galmod.build_gallery(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    return path
 
 
 class Bot:
@@ -905,8 +951,9 @@ class Bot:
 def main():
     import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--gallery", default=os.path.join(
-        os.environ.get("CLAUDE_JOB_DIR", "/tmp"), "tmp", "gallery_lvl1.npz"))
+    ap.add_argument("--gallery", default=dsio.GALLERY_PATH,
+                    help="NCC reference gallery; (re)built from harvest data at "
+                         "startup if missing (see ensure_gallery)")
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--max-level", type=int, default=13)
     ap.add_argument("--transition", default="ei", choices=["ei", "click"])
@@ -927,6 +974,7 @@ def main():
     ap.add_argument("--no-flash", action="store_true",
                     help="skip the level-start full-grid flash (--demo)")
     args = ap.parse_args()
+    ensure_gallery(args.gallery)
     bot = Bot(args.gallery, verbose=not args.q, transition_mode=args.transition,
               model_path=args.model)
     if args.rollout:
