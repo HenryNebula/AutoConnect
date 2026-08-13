@@ -43,7 +43,7 @@ pair-crops is the whole tile set, and the per-pair relation is an *exact*
 same-type partition of that board.
 
 Robustness notes (all learned the hard way):
-* `detect_grid` mis-clusters sparse boards (66 tiles → 13×7), so we only lock
+* grid detection mis-clusters sparse boards (66 tiles → 13×7), so we only lock
   the lattice on a **full** board and apply a stable per-move global
   `drift_correct` (the level "movement" mechanics do not actually shift the
   lattice);
@@ -110,9 +110,6 @@ AC_DATA_DIR=/media/ext4-data/autoconnect-data python solver/train_classifier.py
 
 # 4. NN vs NCC type-clustering comparison on level 13
 AC_DATA_DIR=/media/ext4-data/autoconnect-data python solver/gallery_nn.py --level 13
-
-# (optional) independent VLM label-noise check via qwen3.5-4b on :8000
-AC_DATA_DIR=/media/ext4-data/autoconnect-data python solver/qwen_verify.py --n 60
 ```
 
 The oracle SWF must be running (patched, with the ExternalInterface bridge) — see
