@@ -2011,6 +2011,8 @@ package kawai2_fla
                ExternalInterface.addCallback("acStep", acStep);
                ExternalInterface.addCallback("acPlayOne", acPlayOneVoid);
                ExternalInterface.addCallback("acRemovePair", acRemovePair);
+               ExternalInterface.addCallback("acReshuffle", acReshuffle);
+               ExternalInterface.addCallback("acAdvance", acAdvance);
             }
             catch(e:*) { acRegErr = "reg:" + String(e); }
          }
@@ -2102,6 +2104,23 @@ package kawai2_fla
             return;
          }
          acPlayOne();
+      }
+
+      // AutoConnect airtight no-cunufi entry points: the CV brain drives via
+      // these instead of acPlayOne/acStep, both of which can reach vum.cunufi
+      // (the builtin pair-finder). acReshuffle reshuffles the board directly
+      // (createNewMap); acAdvance dismisses the result overlay only
+      // (acHandleResult). Neither executes a pair the brain didn't choose.
+      public function acReshuffle() : String
+      {
+         createNewMap(null);
+         return acStatus();
+      }
+
+      public function acAdvance() : String
+      {
+         acHandleResult();
+         return acStatus();
       }
 
       public function acHandleResult() : Boolean
