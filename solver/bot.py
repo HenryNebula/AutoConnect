@@ -91,6 +91,16 @@ class Bot:
         self._cf_counter = 0       # per-call seed source for reproducible rollouts
         self._sim = None            # cached all-pairs tile-sim matrix (NN only)
         self._sim_tiles = None      # id(self.cur_tiles) the cache belongs to
+        # Demo / visualization (--demo): paint a DOM bbox overlay on each chosen
+        # pair in the live browser window, pause, THEN clear (acRemovePair is
+        # instant, so the pause must precede it for the boxes to be visible).
+        # Cosmetic only -- every overlay call is try/except-guarded so it can
+        # never break a run. See _demo_show / _demo_pair / _demo_hide.
+        self.demo = False          # paint the per-pair bbox overlay before clears
+        self.demo_pause = 0.7      # seconds each pair's boxes stay on screen
+        self.demo_flash = True     # flash a box over every grid cell at level start
+        self.save_frames = False   # also write annotated PNGs to $tmp/demo/
+        self._frame_idx = 0
 
     @staticmethod
     def _default_siamese_model():
@@ -381,7 +391,106 @@ class Bot:
             self.use_remove_pair = bool(_has_ei("acRemovePair"))
         return self.use_remove_pair
 
+    # ---- demo / visualization (--demo) -----------------------------------
+    # Paint a DOM bbox overlay on the chosen pair in the live browser window so
+    # the solver's picks are visible (and screen-recordable) before each clear.
+    # Coordinates reuse the same grid xs/ys/ts the click path uses, so boxes sit
+    # exactly on tiles; the overlay is position:fixed at z-index max so it paints
+    # above Ruffle's shadow-DOM dimming veil (bright on the dim recorded board).
+    # Every call is try/except-guarded -- the overlay is cosmetic and must never
+    # break a run.
+    def _demo_show(self, boxes):
+        """Render the given boxes [{x,y,w,h,color,label?}] into #ac-demo-overlay.
+        Host is document.body (no transformed ancestor -> position:fixed stays
+        viewport-anchored and the max z-index beats the flattened shadow veil).
+        Fallback if a visual test shows the veil painting above: swap the host
+        for document.getElementsByTagName('ruffle-embed')[0].shadowRoot."""
+        if not self.demo:
+            return
+        js = """(function(boxes){
+var host=document.body;
+var ov=document.getElementById('ac-demo-overlay');
+if(!ov){ov=document.createElement('div');ov.id='ac-demo-overlay';
+ov.style.cssText='position:fixed;left:0;top:0;width:100vw;height:100vh;pointer-events:none;z-index:2147483647;margin:0;padding:0;';
+host.appendChild(ov);}
+ov.innerHTML='';
+for(var i=0;i<boxes.length;i++){
+var b=boxes[i],d=document.createElement('div');
+d.style.cssText='position:absolute;box-sizing:border-box;left:'+b.x.toFixed(1)+'px;top:'+b.y.toFixed(1)+'px;width:'+b.w.toFixed(1)+'px;height:'+b.h.toFixed(1)+'px;border:3px solid '+b.color+';box-shadow:0 0 6px '+b.color+',0 0 6px '+b.color+';background:transparent;';
+if(b.label){var lbl=document.createElement('div');lbl.textContent=b.label;
+lbl.style.cssText='position:absolute;top:-18px;left:0;color:'+b.color+';font:bold 14px monospace;text-shadow:0 0 3px #000,0 0 3px #000,0 0 3px #000;';
+d.appendChild(lbl);}
+ov.appendChild(d);}
+})(""" + json.dumps(boxes) + ")"
+        try:
+            cdp.eval_js(js)
+        except Exception:  # noqa: BLE001  -- overlay is cosmetic
+            pass
+
+    def _demo_hide(self):
+        if not self.demo:
+            return
+        try:
+            cdp.eval_js("(function(){var o=document.getElementById('ac-demo-overlay');"
+                        "if(o)o.innerHTML='';})()")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _demo_pair(self, r1, c1, r2, c2):
+        """Outline the chosen pair: tile 1 cyan, tile 2 yellow (with order labels)."""
+        if not self.demo:
+            return
+        g = self.grid
+        ts = float(g["ts"])
+
+        def box(r, c, color, label):
+            return {"x": float(g["xs"][c]) - ts / 2, "y": float(g["ys"][r]) - ts / 2,
+                    "w": ts, "h": ts, "color": color, "label": label}
+        self._demo_show([box(r1, c1, "#00FFFF", "1"), box(r2, c2, "#FFFF00", "2")])
+        if self.save_frames:
+            self._save_demo_frame(r1, c1, r2, c2)
+
+    def _save_demo_frame(self, r1, c1, r2, c2):
+        """Snapshot the (bright, unveiled) bot view, draw the pair boxes, save a
+        PNG. For demo frame sequences / recording material; off unless
+        --save-frames. These PNGs are the BRIGHT screenshot (the dimming veil
+        doesn't composite into Page.captureScreenshot), distinct from the dim
+        recorded window."""
+        from PIL import Image, ImageDraw
+        pil = Image.fromarray(self.snap())
+        d = ImageDraw.Draw(pil)
+        g = self.grid
+        ts = float(g["ts"])
+
+        def rect(r, c, color):
+            x = float(g["xs"][c]) - ts / 2
+            y = float(g["ys"][r]) - ts / 2
+            d.rectangle([x, y, x + ts, y + ts], outline=color, width=4)
+        rect(r1, c1, (0, 255, 255))
+        rect(r2, c2, (255, 255, 0))
+        out_dir = os.path.join(os.environ.get("CLAUDE_JOB_DIR", "/tmp"), "tmp", "demo")
+        os.makedirs(out_dir, exist_ok=True)
+        self._frame_idx += 1
+        pil.save(os.path.join(out_dir, f"{self._frame_idx:04d}.png"))
+
     def _click_pair_removes(self, r1, c1, r2, c2, retries=3):
+        """Remove a pair and confirm by the game's tile count dropping.
+
+        In --demo mode, paint the bbox overlay on the chosen pair and pause
+        BEFORE the (instant) acRemovePair dispatch so the boxes are visible
+        while the tiles are still on screen; remove the overlay afterwards
+        (try/finally so it never leaks across returns / level transitions).
+        """
+        if self.demo:
+            self._demo_pair(r1, c1, r2, c2)
+            time.sleep(self.demo_pause)
+        try:
+            return self._click_pair_removes_inner(r1, c1, r2, c2, retries)
+        finally:
+            if self.demo:
+                self._demo_hide()
+
+    def _click_pair_removes_inner(self, r1, c1, r2, c2, retries=3):
         """Remove a pair and confirm by the game's tile count dropping.
 
         Uses the SWF's ``acRemovePair`` ExternalInterface handle when available
@@ -478,6 +587,18 @@ class Bot:
         self.cur_tiles = vision.extract_tiles(img, self.grid)
         self._recover_count = 0
         present = np.ones((self.grid["rows"], self.grid["cols"]), dtype=bool)
+
+        if self.demo and self.demo_flash:
+            # Flash a faint box over every detected grid cell so a viewer sees
+            # the full lattice the solver perceives, before move-by-move picks.
+            g = self.grid
+            ts = float(g["ts"])
+            cells = [{"x": float(g["xs"][c]) - ts / 2, "y": float(g["ys"][r]) - ts / 2,
+                      "w": ts, "h": ts, "color": "rgba(0,255,255,0.35)"}
+                     for r in range(g["rows"]) for c in range(g["cols"])]
+            self._demo_show(cells)
+            time.sleep(1.5)
+            self._demo_hide()
 
         # Warm the click path: click top picks (with retry) until tilesLeft
         # first drops, tracking the removal so the present mask stays exact.
@@ -848,6 +969,15 @@ def main():
                     help="enable the C++ rollout lookahead (conn_fast)")
     ap.add_argument("--ncc", action="store_true",
                     help="use colour-NCC as the tile backbone (skip the NN model)")
+    ap.add_argument("--demo", action="store_true",
+                    help="paint a bbox overlay on each chosen pair in the browser "
+                         "window before clearing (for live viewing / recording)")
+    ap.add_argument("--pause", type=float, default=0.7,
+                    help="seconds each pair's boxes stay on screen (--demo)")
+    ap.add_argument("--save-frames", action="store_true",
+                    help="also save annotated PNGs of each pick to $tmp/demo/")
+    ap.add_argument("--no-flash", action="store_true",
+                    help="skip the level-start full-grid flash (--demo)")
     args = ap.parse_args()
     bot = Bot(args.gallery, verbose=not args.q, transition_mode=args.transition,
               model_path=args.model)
@@ -860,6 +990,13 @@ def main():
         bot.nn = None
         bot.cand_thr = 0.7
         print("[bot] backbone = colour-NCC (cand_thr=0.7)")
+    if args.demo:
+        bot.demo = True
+        bot.demo_pause = args.pause
+        bot.demo_flash = not args.no_flash
+        bot.save_frames = args.save_frames
+        print(f"[bot] demo mode on (pause={args.pause}s, flash={bot.demo_flash}, "
+              f"save_frames={bot.save_frames})")
     bot.play_game(args.runs, args.max_level)
 
 
