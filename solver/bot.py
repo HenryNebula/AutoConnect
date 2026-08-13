@@ -52,6 +52,8 @@ class Bot:
         self.known_diff = set()
         self.click_settle = 0.20
         self.verify_wait = 0.40
+        self.gravity_settle = 0.6   # wait for L2+ per-level gravity (dongzuo) to
+                                    # settle after a removal before re-snapping
         # Game I/O backend: CDPGameIO for the local-Chrome rig, WSGameIO for the
         # LAN browser backend. The brain calls self.io.* and never imports cdp
         # for game I/O (only the click-cell fallback still uses cdp directly).
@@ -519,22 +521,22 @@ class Bot:
         return present
 
     def clear_board(self, max_moves=140):
-        """Clear the current board, fast.
+        """Clear the current board.
 
-        Grid + tiles are snapshotted ONCE (tiles don't drift mid-level -- the
-        level mechanics are layout-only); the sim matrix is built once and the
-        per-move classifier just masks removed cells via ``present``. Each
-        removal is confirmed by the GAME's tilesLeft dropping; a non-drop means
-        a mis-classification (the pair is blacklisted). On a deadlock the SWF
-        reshuffles (acPlayOne -> createNewMap) and the board is re-snapshotted.
+        Re-perceives the board EVERY move (re-snapshot + re-extract tiles +
+        rebuild the sim matrix + re-derive present). L2+ levels apply per-level
+        gravity after every removal (``dongzuo``: L2 = createBottomMap, tiles
+        fall; L3+ = left/up/right/diagonal variants), so a level-start snapshot
+        would desync and cause false-positive pair picks. (L1 has no gravity, but
+        re-perceiving is harmless there.) Each removal is confirmed by tilesLeft
+        dropping; on a deadlock the SWF reshuffles (acReshuffle -> createNewMap).
         """
         if not self.establish_grid():
             return False, 0
         img = self.snap()
         self.learn_std_threshold(img)
-        # Snapshot tiles ONCE for the level -- tiles don't drift (level mechanics
-        # are layout-only), so the sim matrix + classifier reuse this, masking
-        # removed cells via `present` instead of re-snapping every move.
+        # Initial perception -- used by the warmup for the first, pre-gravity
+        # move; the main loop re-perceives every move after that.
         self.cur_tiles = vision.extract_tiles(img, self.grid)
         self._recover_count = 0
         present = np.ones((self.grid["rows"], self.grid["cols"]), dtype=bool)
@@ -569,28 +571,35 @@ class Bot:
         fails = 0
         cleared = False
         while moves < max_moves:
-            if not present.any() or self._tiles_left() < 2:
+            tl = self._tiles_left()
+            if tl < 2:
+                cleared = True
+                break
+            # Re-perceive EVERY move. L2+ levels apply per-level gravity after
+            # each removal (dongzuo(): L2=createBottomMap tiles fall, L3+ left/
+            # up/right/diagonal variants), so a level-start snapshot desyncs and
+            # causes false-positive pair picks. Re-snapshot + re-extract + rebuild
+            # the sim matrix + re-derive present from the live board.
+            img = self.snap()
+            self.cur_tiles = vision.extract_tiles(img, self.grid)
+            self._sim = None                       # force _ensure_sim rebuild
+            present = self.present_by_count(img, tl)
+            if not present.any():
                 cleared = True
                 break
             mv = self._pick_move(present)
-            progressed = False
-            if mv is not None:
-                (r1, c1), (r2, c2) = mv
-                if self._click_pair_removes(r1, c1, r2, c2):
-                    moves += 1
-                    fails = 0
-                    progressed = True
-                    present[r1, c1] = False
-                    present[r2, c2] = False
-                    if moves % 12 == 0 and self.verbose:
-                        print(f"[bot] {moves} moves, {int(present.sum())} left", flush=True)
-                else:
-                    # acRemovePair is deterministic: a fail means the pair isn't
-                    # truly same-type (NN false positive). Blacklist it; if this
-                    # keeps happening the board is effectively deadlocked for us.
-                    self.known_diff.add(frozenset(((r1, c1), (r2, c2))))
-            if progressed:
+            if mv is not None and self._click_pair_removes(
+                    mv[0][0], mv[0][1], mv[1][0], mv[1][1]):
+                moves += 1
+                fails = 0
+                if moves % 12 == 0 and self.verbose:
+                    print(f"[bot] {moves} moves, {self._tiles_left()} left", flush=True)
+                time.sleep(self.gravity_settle)     # let the gravity anim settle
                 continue
+            # No progress: a deterministic acRemovePair fail means the two tiles
+            # at those cells aren't truly same-type -- blacklist and re-pick.
+            if mv is not None:
+                self.known_diff.add(frozenset((mv[0], mv[1])))
             fails += 1
             if fails and fails % 20 == 0:
                 self.known_diff.clear()
@@ -599,16 +608,15 @@ class Bot:
                           f"tilesLeft={self._tiles_left()}", flush=True)
             if fails < 15:
                 continue
-            # Stuck -- no progress for ~15 attempts (no move found, or every
-            # candidate is a false positive). Re-derive present; reshuffle if
-            # genuinely deadlocked (acPlayOne -> createNewMap), then resume.
+            # Stuck for ~15 attempts -> re-derive present; reshuffle
+            # (acReshuffle -> createNewMap) if genuinely deadlocked, then resume.
             present = self._try_reshuffle(present)
             if present is None:
                 break
             self.known_diff.clear()
             fails = 0
-            if not present.any() or self._tiles_left() < 2:
-                cleared = self._tiles_left() < 2
+            if self._tiles_left() < 2:
+                cleared = True
                 break
         if not cleared:
             cleared = self._tiles_left() < 2
